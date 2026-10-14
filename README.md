@@ -4,7 +4,7 @@ A local, fair GPU queue for one Mac, shared by all projects and agents. One job 
 agents submit, keep working, and wake on completion. Python 3.11+ standard library only — no packages.
 Requires macOS on Apple Silicon and the Xcode command-line tools (`xcode-select --install`) to build the menu bar app.
 
-<p align="center"><img src="docs/logo.png" width="200" alt="Anvil logo"></p>
+<p align="center"><img src="docs/anvil-logo.png" width="220" alt="Anvil logo"></p>
 
 ## Install
 
