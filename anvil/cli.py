@@ -16,7 +16,12 @@ from . import config
 ENV_CAPTURE = ("PATH", "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "PYTHONPATH")
 ROOT = Path(__file__).parent.parent
 AGENTS = Path.home() / "Library/LaunchAgents"
-APP = Path.home() / "Applications/Anvil.app"
+APP = config.APP
+
+
+SANDBOXED = {"error": "permission_denied",
+             "message": "the agent sandbox blocks Anvil's local service; rerun this anvil command with "
+                        "permission to run outside the sandbox"}
 
 
 class ApiError(Exception):
@@ -46,6 +51,8 @@ def api(method, path, body=None, timeout=10, autostart=True):
             start_daemon()
             return api(method, path, body, timeout, autostart=False)
         raise ApiError({"error": "unavailable", "message": f"anvil service not running: {e}"})
+    except PermissionError as e:
+        raise ApiError(SANDBOXED | {"message": f"{SANDBOXED['message']} ({e})"})
     except OSError as e:
         raise ApiError({"error": "unavailable", "message": f"anvil service unreachable: {e}"})
     finally:
@@ -324,8 +331,9 @@ def main(argv=None):
     s.add_argument("--no-drift-check", action="store_true")
     s.add_argument("cmd", nargs=argparse.REMAINDER)
 
-    s = sub("status", lambda a: out(api("GET", f"/api/jobs/{a.id}")), "one job, compact")
-    s.add_argument("id")
+    s = sub("status", lambda a: out(api("GET", f"/api/jobs/{a.id}" if a.id else "/api/overview")),
+            "one job, compact; without an id, the whole queue")
+    s.add_argument("id", nargs="?")
     s = sub("show", lambda a: out(api("GET", f"/api/jobs/{a.id}/detail")), "full record: command, attempts, history")
     s.add_argument("id")
     s = sub("list", lambda a: out(api("GET", "/api/jobs" + qs(project=a.project, agent=a.agent, status=a.status,
@@ -415,4 +423,7 @@ def main(argv=None):
         a.fn(a)
     except ApiError as e:
         out(e.obj)
+        sys.exit(1)
+    except PermissionError as e:  # e.g. creating $ANVIL_HOME or the service log from inside a sandbox
+        out(SANDBOXED | {"message": f"{SANDBOXED['message']} ({e})"})
         sys.exit(1)

@@ -28,7 +28,8 @@ APP = Path.home() / "Applications/Anvil.app"
 
 def home() -> Path:
     p = Path(os.environ.get("ANVIL_HOME", Path.home() / ".anvil"))
-    p.mkdir(parents=True, exist_ok=True)
+    if not p.is_dir():  # mkdir on an existing dir fails with EPERM (not EEXIST) inside agent sandboxes
+        p.mkdir(parents=True, exist_ok=True)
     return p
 
 

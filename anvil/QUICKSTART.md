@@ -20,6 +20,8 @@ The person sees the same queue in the Anvil menu bar app and may hold, reorder o
 - `-t` timeout is a hard limit from launch (default 300s); queue wait doesn't count. `-e` is advisory only.
 - `--key K` makes the submit idempotent: repeating it returns the original job.
 - Retries are opt-in: `--max-attempts 3 --retry-codes 75 --retry-on timed_out --backoff 30`.
+If your tools run commands in a sandbox, run `anvil` with permission to leave it: the service lives in
+`~/.anvil` and the sandbox blocks it (`{"error":"permission_denied"}`). `anvil status` shows the whole queue.
 - `--start-before +3600` cancels the job (reason `queue_deadline`) if it hasn't started in time.
 
 ### Waiting (don't poll)
