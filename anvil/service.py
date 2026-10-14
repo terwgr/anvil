@@ -461,8 +461,10 @@ class Service:
                  **(json.loads(r["data"]) if r["data"] else {})} for r in rows]
 
     def wait(self, job=None, revision=None, cursor=None, agent=None, project=None, timeout=30, until_done=False):
-        """Bounded wait. With job+revision: returns when that job's record changes. With cursor: returns new
-        events. Returns {'unchanged': True, ...} on timeout."""
+        """Bounded wait (<=600s per call; the CLI repeats it). With job: returns when that job's record changes
+        (until_done: when it finishes). Without job, until_done: returns the agent's finished jobs that no wait
+        has returned yet, or none_pending when it has nothing left to wait for. With cursor: returns new events.
+        Returns {'unchanged': True, ...} on timeout."""
         timeout = max(0.0, min(float(timeout or 30), 600))
         deadline = time.monotonic() + timeout
         while True:
@@ -472,7 +474,27 @@ class Service:
                     done = j["status"] in FINAL
                     changed = revision is None or j["rev"] != int(revision)
                     if (changed and not until_done) or (until_done and done):
+                        if done:
+                            self.x("UPDATE jobs SET reported=1 WHERE id=?", job)
                         return self.status(job, j)
+                    cur = self.cursor()
+                elif until_done:
+                    if not (agent or project):  # otherwise one agent's wait would consume everyone's results
+                        raise Err("invalid", "waiting for any finished job needs an agent (or project)")
+                    w, a = ["hidden=0"], []
+                    for col, v in (("agent", agent), ("project", project)):
+                        if v:
+                            w.append(f"{col}=?")
+                            a.append(v)
+                    rows = self.q(f"SELECT id, status FROM jobs WHERE {' AND '.join(w)} AND "
+                                  f"(reported=0 OR status NOT IN ({','.join('?' * len(FINAL))})) ORDER BY finished",
+                                  *a, *FINAL)
+                    finished = [r["id"] for r in rows if r["status"] in FINAL]
+                    if finished:
+                        self.x(f"UPDATE jobs SET reported=1 WHERE id IN ({','.join('?' * len(finished))})", *finished)
+                        return {"jobs": [self.status(i) for i in finished], "pending": len(rows) - len(finished)}
+                    if not rows:
+                        return {"jobs": [], "pending": 0, "none_pending": True}
                     cur = self.cursor()
                 else:
                     ev = self.events(cursor if cursor is not None else self.cursor(), None, agent, project)
@@ -485,6 +507,15 @@ class Service:
                 out = {"unchanged": True, "cursor": cur}
                 if job:
                     out.update(id=job, rev=j["rev"], status=j["status"])
+                    st = self.status(job, j)
+                    est = st.get("est_s")
+                    if est is not None:  # nudge short polling loops toward one wait that covers the job
+                        rest = max(0, est - st.get("elapsed_s", 0)) if j["status"] == "running" \
+                            else (st.get("approx_wait_s") or 0) + est
+                        out["approx_left_s"] = round(rest)
+                        out["hint"] = (f"nothing changed; about {round(rest)}s left by the estimates. Wait once "
+                                       f"with no timeout (MCP: call gpu_wait again right away), in the background if you can, "
+                                       f"instead of polling")
                 return out
             with self.ev_cv:
                 self.ev_cv.wait(min(left, 5))

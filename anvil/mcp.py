@@ -7,7 +7,8 @@ from .cli import ApiError, api, qs
 
 AGENT = os.environ.get("ANVIL_AGENT")
 GUIDE = ("Anvil: the GPU queue on this computer. Run every GPU or heavy compute job through gpu_submit, "
-         "never directly; keep working, then gpu_wait(until_done). The CLI equivalent and full guide: `anvil help`.")
+         "never directly. Don't poll: after submitting, keep working, then call gpu_wait(until_done, timeout 600) "
+         "and repeat only while it returns unchanged. The CLI equivalent and full guide: `anvil help`.")
 S, I, N, B, A = ({"type": "string"}, {"type": "integer"}, {"type": "number"}, {"type": "boolean"},
                  {"type": "array", "items": {"type": "string"}})
 
@@ -32,7 +33,9 @@ TOOLS = [
     tool("gpu_list", "List jobs, newest first; filter project/agent/status (comma list); page with 'after'=next.",
          {"project": S, "agent": S, "status": S, "limit": I, "after": S}),
     tool("gpu_wait", "Bounded wait (<=600s). With id+rev: returns the job when its record changes "
-         "(until_done: only when final). With cursor: returns new events. Returns {unchanged:true} on timeout.",
+         "(until_done: only when final). Without id, until_done: returns your (agent) finished jobs that no wait has "
+         "returned yet, or none_pending. With cursor: returns new events. Returns {unchanged:true} on timeout "
+         "(default 600s with until_done): call again, don't poll status or logs in between.",
          {"id": S, "rev": I, "until_done": B, "cursor": I, "agent": S, "timeout": N}),
     tool("gpu_logs", "Bounded log tail (bytes) or bytes since cursor. Returns data, cursor, truncated_before, more.",
          {"id": S, "tail": I, "since": I, "attempt": I}, ("id",)),
@@ -57,9 +60,10 @@ def call(name, a):
     if name == "gpu_list":
         return api("GET", "/api/jobs" + qs(**a))
     if name == "gpu_wait":
-        t = min(float(a.get("timeout", 60)), 600)
+        t = min(float(a.get("timeout", 600 if a.get("until_done") else 60)), 600)
+        agent = a.get("agent") or (AGENT if not a.get("id") else None)
         return api("GET", "/api/wait" + qs(job=a.get("id"), revision=a.get("rev"), cursor=a.get("cursor"),
-                                           agent=a.get("agent"), timeout=t, until_done=a.get("until_done")),
+                                           agent=agent, timeout=t, until_done=a.get("until_done")),
                    timeout=t + 10)
     if name == "gpu_logs":
         return api("GET", f"/api/jobs/{a.pop('id')}/logs" + qs(**a))

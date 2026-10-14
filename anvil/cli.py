@@ -215,13 +215,18 @@ def control(op, **extra):
 
 
 def cmd_wait(a):
-    deadline = time.monotonic() + a.timeout
+    # With --until-done and no --timeout there is no deadline: the call returns when the work is done.
+    timeout = a.timeout if a.timeout is not None else None if a.until_done else 60
+    deadline = None if timeout is None else time.monotonic() + timeout
+    cursor = a.cursor
+    agent = a.agent or (os.environ.get("ANVIL_AGENT") if a.until_done and not a.id else None)
     while True:
-        left = max(1, deadline - time.monotonic())
-        r = api("GET", "/api/wait" + qs(job=a.id, revision=a.rev, cursor=a.cursor, agent=a.agent,
-                                        timeout=min(left, 300), until_done=a.until_done), timeout=min(left, 300) + 10)
-        if not r.get("unchanged") or time.monotonic() >= deadline:
+        left = 300 if deadline is None else max(1, min(deadline - time.monotonic(), 300))
+        r = api("GET", "/api/wait" + qs(job=a.id, revision=a.rev, cursor=cursor, agent=agent,
+                                        timeout=left, until_done=a.until_done), timeout=left + 10)
+        if not r.get("unchanged") or (deadline is not None and time.monotonic() >= deadline):
             return out(r)
+        cursor = r.get("cursor", cursor)  # don't miss events between rounds
 
 
 def cmd_logs(a):
@@ -292,6 +297,7 @@ def register_mcp(add):
 
 
 def cmd_install(a):
+    remove_login_items()
     build_app()
     out({"app": str(APP), "mcp": register_mcp(True)})
 
@@ -305,7 +311,6 @@ def cmd_uninstall(a):
 
 
 def main(argv=None):
-    remove_login_items()
     p = argparse.ArgumentParser(prog="anvil", description="Local fair GPU queue. Output is compact JSON.")
     p.add_argument("--actor", help="who is acting (default $ANVIL_AGENT or 'human')")
     sp = p.add_subparsers(dest="cmd_name", required=True)
@@ -346,13 +351,13 @@ def main(argv=None):
     for f in ("--project", "--agent", "--status", "--after"):
         s.add_argument(f)
     s.add_argument("--limit", type=int, default=20)
-    s = sub("wait", cmd_wait, "bounded wait for a change")
+    s = sub("wait", cmd_wait, "wait for a change; with --until-done, until the job finishes")
     s.add_argument("id", nargs="?")
     s.add_argument("--rev", type=int, help="return when the job's rev differs")
     s.add_argument("--until-done", action="store_true")
     s.add_argument("--cursor", type=int, help="event cursor (without id)")
     s.add_argument("--agent")
-    s.add_argument("--timeout", type=float, default=60)
+    s.add_argument("--timeout", type=float, help="seconds; default: no limit with --until-done, else 60")
     s = sub("events", lambda a: out(api("GET", "/api/events" + qs(cursor=a.cursor, agent=a.agent, job=a.job))),
             "events after a cursor (missed-event recovery)")
     s.add_argument("--cursor", type=int, default=0)
@@ -386,7 +391,8 @@ def main(argv=None):
     s = sub("run-next", control("run_next", reason=1), "operator override: start this job next")
     s.add_argument("id")
     s.add_argument("--reason", required=True)
-    s = sub("timeout", control("timeout", seconds=1), "set limit (running: absolute from start)")
+    s = sub("timeout", control("timeout", seconds=1), "set the time limit (running: absolute from start; "
+            "0 or none = no limit)")
     s.add_argument("id")
     s.add_argument("seconds", type=time_limit)
     s = sub("rerun", control("rerun", timeout_seconds=1), "rerun a finished job as a new linked job")
