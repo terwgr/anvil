@@ -47,7 +47,7 @@ anvil submit -n train -e 120 -t 900 -- python3 train.py
   `anvil app` opens it.
 - `anvil top` — live terminal view; `anvil view` — one-shot.
 - Agents: tell any agent "use Anvil for the GPU". Running `anvil` (or `anvil help`) prints its guide ([anvil/QUICKSTART.md](anvil/QUICKSTART.md)).
-- MCP: agents get `gpu_submit`, `gpu_wait`, `gpu_logs` and the rest; they pass `agent` on submit.
+- MCP: agents get `gpu_submit`, `gpu_wait`, `gpu_logs` and the rest; they pass `agent` to name themselves.
 
 Route each project's GPU entrypoint through `anvil submit`; work started outside Anvil is detected
 best-effort and shown, never killed.
@@ -55,10 +55,11 @@ best-effort and shown, never killed.
 ## Configuration
 
 The service listens only on a private Unix socket, `~/.anvil/anvil.sock` (owner-only); there is no
-network port. `~/.anvil/config.json` (all optional): `default_timeout_seconds` (hard limit for jobs submitted without `-t`; default none = no limit),
-`max_timeout_seconds` (if set, every job needs a limit up to it),
-`operators` (actors allowed to pause, run-next and control others' jobs; default `["human","panel"]`,
-`"*"` for everyone), `log_retention` (`max_total_mb`, `max_age_days`), `outside_gpu_patterns`, `hooks`.
+network port. `~/.anvil/config.json` (all optional): `default_timeout_seconds` (hard limit for jobs
+submitted without one; default none, so jobs run until they finish), `max_timeout_seconds` (if set, every
+job needs a limit up to it), `operators` (actors allowed to pause, run-next and control others' jobs;
+default `["human","panel"]`, `"*"` for everyone), `log_retention` (`max_total_mb`, `max_age_days`),
+`outside_gpu_patterns`, `hooks`.
 Data, logs and results live in `~/.anvil` (`ANVIL_HOME` overrides).
 
 ## Layout
@@ -66,6 +67,7 @@ Data, logs and results live in `~/.anvil` (`ANVIL_HOME` overrides).
 `anvil/service.py` store, scheduler, runner, events · `anvil/sched.py` fairness policy ·
 `anvil/server.py` API on the Unix socket · `anvil/Anvil.swift` menu bar app · `anvil/cli.py` CLI + terminal view ·
 `anvil/mcp.py` MCP adapter · `anvil/wrap.py` job process-group leader (records exit status across restarts).
+
 ## Checks
 
 ```bash

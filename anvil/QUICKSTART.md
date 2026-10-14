@@ -17,11 +17,12 @@ repeated status or log checks while it runs. Each check that finds nothing new c
 Several jobs: `anvil wait --until-done` (no id) returns your finished jobs that no wait has returned yet;
 repeat it until it says `"none_pending":true`. Nothing is missed between calls.
 
-`-e` your runtime guess (seconds, advisory; a rough guess is fine) · `-t` optional hard time limit from launch (default none) ·
-`-n` short name · `--note` why. All output is compact JSON; errors are `{"error":..,"message":..}`, exit 1.
+`-e` your runtime guess (seconds, advisory; a rough guess is fine) · `-t` optional hard time limit from
+launch (default none) · `-n` short name · `--note` why. All output is compact JSON; errors are
+`{"error":..,"message":..}`, exit 1. `anvil status` shows the whole queue.
 The person sees the same queue in the Anvil menu bar app and may hold, reorder or stop your jobs.
 If your tools run commands in a sandbox, run `anvil` with permission to leave it: the service lives in
-`~/.anvil` and the sandbox blocks it (`{"error":"permission_denied"}`). `anvil status` shows the whole queue.
+`~/.anvil` and the sandbox blocks it (`{"error":"permission_denied"}`).
 
 ## Details
 - Project defaults to the git repo name, else the folder name; cwd, PATH and venv are captured.
@@ -53,12 +54,13 @@ Write result files to `$ANVIL_RESULT_DIR`. Optional progress: write
 `{"message":"epoch 3/10","fraction":0.3}` to `$ANVIL_PROGRESS_FILE`.
 
 ### Control
-    anvil cancel j12 | hold j12 | release j12 | timeout j12 1800 | rerun j12 | ack j12
+    anvil cancel j12 | hold j12 | release j12 | timeout j12 1800 | rerun j12 | ack j12   # timeout j12 none: no limit
     anvil remove j12                         # drop from views (cancels if pending); `anvil clear` for all finished
     anvil reorder j12 --before j10          # your own pending jobs only
     anvil run-next j12 --reason "..."        # operators only; visible to everyone
     anvil list --agent me --status queued,running
 Fairness: projects get equal GPU time, then agents within a project. Many submissions earn no extra
-share. Errors: `{"error":"code","message":"..."}` with exit status 1.
+share.
 
-MCP: the `anvil-mcp` server offers the same as gpu_submit, gpu_wait, gpu_logs, gpu_status, gpu_list, gpu_control, gpu_overview.
+MCP: the `anvil-mcp` server offers the same commands as tools: gpu_submit, gpu_wait, gpu_logs, gpu_status, gpu_list,
+gpu_control, gpu_overview. gpu_wait waits up to 600s per call; call it again while it returns unchanged.
