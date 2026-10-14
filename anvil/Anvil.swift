@@ -92,6 +92,20 @@ struct Job: Identifiable, Equatable {
     static func == (a: Job, b: Job) -> Bool { NSDictionary(dictionary: a.d).isEqual(to: b.d) }
 }
 
+/// Time limit as typed in the panel: "90", "30m", "2h"; empty, "0" or "none" means no limit ("none" to the service).
+func parseLimit(_ t: String) -> Any? {
+    let v = t.trimmingCharacters(in: .whitespaces).lowercased()
+    if v.isEmpty || v == "0" || v == "none" { return "none" }
+    let mult: Double = v.hasSuffix("h") ? 3600 : v.hasSuffix("m") ? 60 : 1
+    guard let n = Double(mult == 1 ? v.replacingOccurrences(of: "s", with: "") : String(v.dropLast())), n > 0 else { return nil }
+    return n * mult
+}
+
+func limitText(_ s: Double) -> String {
+    let t = Int(s)
+    return t % 3600 == 0 ? "\(t / 3600)h" : t % 60 == 0 ? "\(t / 60)m" : "\(t)"
+}
+
 func fmt(_ s: Double?) -> String {
     guard let s else { return "—" }
     let t = max(0, Int(s.rounded()))
@@ -566,7 +580,7 @@ struct JobRow: View {
         let d = (store.detail?["id"] as? String) == job.id ? store.detail : nil
         VStack(alignment: .leading, spacing: 4) {
             if let n = job.s("note") { Text(n).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true) }
-            line("\(job.id) · \(job.agent) · est. \(job.n("est_s").map(fmt) ?? "unknown") · limit \(fmt(job.n("timeout_s")))")
+            line("\(job.id) · \(job.agent) · est. \(job.n("est_s").map(fmt) ?? "unknown") · limit \((job.n("timeout_s").map(fmt) ?? "none"))")
             if job.pending, let w = job.s("why") { line(w) }
             if let d {
                 line((d["cmd"] as? [String] ?? []).map { ($0 as NSString).lastPathComponent }.joined(separator: " "))
@@ -613,10 +627,10 @@ struct JobRow: View {
                 }
             }
             if job.pending || s == "running" {
-                TextField("", text: $limit).frame(width: 46).textFieldStyle(.roundedBorder)
-                    .onAppear { limit = String(Int(job.n("timeout_s") ?? 300)) }
-                    .onSubmit { if let v = Double(limit) { store.control(job.id, "timeout", ["seconds": v]) } }
-                    .help("Time limit in seconds; press Return to apply")
+                TextField("none", text: $limit).frame(width: 54).textFieldStyle(.roundedBorder)
+                    .onAppear { limit = job.n("timeout_s").map { limitText($0) } ?? "" }
+                    .onSubmit { if let v = parseLimit(limit) { store.control(job.id, "timeout", ["seconds": v]) } }
+                    .help("Hard time limit: 90 (seconds), 30m, 2h, or empty for none; press Return to apply")
             }
             if final {
                 Button("Rerun") { store.control(job.id, "rerun") }

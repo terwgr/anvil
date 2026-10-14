@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 
 DEFAULTS = {
-    "default_timeout_seconds": 300,
+    "default_timeout_seconds": None,      # per-job hard limit when the submitter gives none; None = no limit
     "max_timeout_seconds": None,          # optional service maximum; oversized requests are rejected
     "overdue_after_seconds": 600,
     "term_grace_seconds": 5,

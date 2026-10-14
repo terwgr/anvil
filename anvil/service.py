@@ -239,12 +239,7 @@ class Service:
         cmd = d["cmd"]
         if not isinstance(cmd, list) or not all(isinstance(c, str) for c in cmd):
             raise Err("invalid", "cmd must be a list of strings")
-        timeout = float(d.get("timeout_seconds") or self.cfg["default_timeout_seconds"])
-        if timeout <= 0:
-            raise Err("invalid", "timeout_seconds must be positive")
-        mx = self.cfg["max_timeout_seconds"]
-        if mx and timeout > mx:
-            raise Err("timeout_too_large", f"timeout {timeout:g}s exceeds service maximum {mx}s")
+        timeout = self.limit(d.get("timeout_seconds"), self.cfg["default_timeout_seconds"])
         est = d.get("estimated_seconds")
         if est is not None and float(est) < 0:
             raise Err("invalid", "estimated_seconds must be >= 0")
@@ -542,16 +537,31 @@ class Service:
         self.action(j["id"], actor, "run_next", reason)
         self.event("run_next", j, by=actor, reason=reason)
 
-    def _c_timeout(self, j, actor, seconds=None):
-        s = float(seconds or 0)
-        if s <= 0:
-            raise Err("invalid", "timeout must be positive")
+    def limit(self, v, default=None):
+        """A job's hard time limit in seconds, or None for no limit (given as 0 or "none")."""
+        if v is None:
+            v = default
+        if v is None or v in (0, "0", "none", ""):
+            s = None
+        else:
+            try:
+                s = float(v)
+            except (TypeError, ValueError):
+                raise Err("invalid", "time limit must be seconds, or 0/\"none\" for no limit")
+            if s <= 0:
+                raise Err("invalid", "time limit must be positive, or 0/\"none\" for no limit")
         mx = self.cfg["max_timeout_seconds"]
-        if mx and s > mx:
-            raise Err("timeout_too_large", f"exceeds service maximum {mx}s")
+        if mx and (s is None or s > mx):
+            raise Err("timeout_too_large", f"time limit must be at most the service maximum {mx}s")
+        return s
+
+    def _c_timeout(self, j, actor, seconds=None):
+        if seconds is None:
+            raise Err("invalid", "missing seconds (0 or \"none\" for no limit)")
+        s = self.limit(seconds)
         if j["status"] == "running":
             el = self.elapsed(j) or 0
-            if s <= el:
+            if s is not None and s <= el:
                 raise Err("invalid", f"limit must exceed elapsed {el:.0f}s (limit is absolute from start)")
             if self.slot and self.slot["job"] == j["id"]:
                 self.slot["limit"] = s
@@ -605,7 +615,8 @@ class Service:
         if j["status"] not in FINAL:
             raise Err("conflict", "rerun applies to finished jobs; use cancel first")
         d = {"project": j["project"], "agent": j["agent"], "name": j["name"], "note": j["note"],
-             "estimated_seconds": j["est"], "timeout_seconds": j["timeout"], "cmd": json.loads(j["cmd"]),
+             "estimated_seconds": j["est"], "timeout_seconds": "none" if j["timeout"] is None else j["timeout"],
+             "cmd": json.loads(j["cmd"]),
              "cwd": j["cwd"], "env": json.loads(j["env"] or "{}"),
              "retry": json.loads(j["retry"]) if j["retry"] else None, "rerun_of": j["id"]}
         d.update({k: v for k, v in over.items() if v is not None})
@@ -783,7 +794,7 @@ class Service:
         pf = self.home / "logs" / s["job"] / "progress.json"
         last_prog, last_prog_t = None, 0.0
         while leader_alive():
-            if s["stop"] is None and time.monotonic() - s["t0"] >= s["limit"]:
+            if s["stop"] is None and s["limit"] is not None and time.monotonic() - s["t0"] >= s["limit"]:
                 s["stop"] = "timeout"
             if s["stop"]:
                 break

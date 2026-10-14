@@ -55,7 +55,8 @@ best-effort and shown, never killed.
 ## Configuration
 
 The service listens only on a private Unix socket, `~/.anvil/anvil.sock` (owner-only); there is no
-network port. `~/.anvil/config.json` (all optional): `default_timeout_seconds` (300), `max_timeout_seconds`,
+network port. `~/.anvil/config.json` (all optional): `default_timeout_seconds` (hard limit for jobs submitted without `-t`; default none = no limit),
+`max_timeout_seconds` (if set, every job needs a limit up to it),
 `operators` (actors allowed to pause, run-next and control others' jobs; default `["human","panel"]`,
 `"*"` for everyone), `log_retention` (`max_total_mb`, `max_age_days`), `outside_gpu_patterns`, `hooks`.
 Data, logs and results live in `~/.anvil` (`ANVIL_HOME` overrides).

@@ -127,8 +127,8 @@ def render(o, stale=False, width=None):
     lines += ["", B + hdr[:width] + X]
     for j in o["queue"]:
         st = j["status"] + ("·" + j["sub"] if j.get("sub") else "")
-        lim = f"{fmt_s(j.get('elapsed_s'))}/{fmt_s(j['timeout_s'])}" if j["status"] == "running" \
-            else f"—/{fmt_s(j['timeout_s'])}"
+        cap = fmt_s(j["timeout_s"]) if j["timeout_s"] else "none"
+        lim = f"{fmt_s(j.get('elapsed_s'))}/{cap}" if j["status"] == "running" else f"—/{cap}"
         why = j.get("why") or (j.get("progress") or {}).get("message", "")
         if j.get("approx_wait_s") is not None:
             why += f" ~{fmt_s(j['approx_wait_s'])}"
@@ -201,6 +201,10 @@ def cmd_submit(a):
             "check_drift": not a.no_drift_check}
     body["actor"] = a.actor or body["agent"]
     out(api("POST", "/api/submit", body))
+
+
+def time_limit(v):  # named for argparse's "invalid time_limit value" message
+    return "none" if v.lower() in ("0", "none") else float(v)
 
 
 def control(op, **extra):
@@ -318,7 +322,8 @@ def main(argv=None):
     s.add_argument("-a", "--agent", help="stable agent id (default $ANVIL_AGENT)")
     s.add_argument("--note")
     s.add_argument("-e", "--estimate", type=float, help="estimated run seconds (advisory)")
-    s.add_argument("-t", "--timeout", type=float, help="limit seconds (default 300)")
+    s.add_argument("-t", "--timeout", type=time_limit, help="hard time limit, seconds from launch "
+                   "(default: none, or the config default; 0 or none = no limit)")
     s.add_argument("--start-before", help="cancel if not started by: +SECONDS or ISO time")
     s.add_argument("--key", help="submission key; a repeat returns the original job")
     s.add_argument("--cwd")
@@ -383,10 +388,10 @@ def main(argv=None):
     s.add_argument("--reason", required=True)
     s = sub("timeout", control("timeout", seconds=1), "set limit (running: absolute from start)")
     s.add_argument("id")
-    s.add_argument("seconds", type=float)
+    s.add_argument("seconds", type=time_limit)
     s = sub("rerun", control("rerun", timeout_seconds=1), "rerun a finished job as a new linked job")
     s.add_argument("id")
-    s.add_argument("--timeout", dest="timeout_seconds", type=float)
+    s.add_argument("--timeout", dest="timeout_seconds", type=time_limit)
     s = sub("clear", lambda a: out(api("POST", "/api/clear", {"actor": actor(a), "project": a.project,
                                                               "agent": a.agent})), "remove all finished jobs from views")
     s.add_argument("--project")

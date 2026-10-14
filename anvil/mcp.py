@@ -19,10 +19,11 @@ def tool(name, desc, props, req=()):
 
 TOOLS = [
     tool("gpu_submit", "Queue a GPU job; returns at once with id, status, position, rev. Runs in cwd with captured "
-         "PATH/venv. timeout_seconds default 300 (hard limit; estimate never extends it). submission_key makes "
+         "PATH/venv. timeout_seconds: optional hard limit from launch (default none; 0 or \"none\" = no limit; "
+         "estimate never extends it). submission_key makes "
          "retries idempotent. Then do other work; use gpu_wait.",
          {"name": S, "cmd": A, "cwd": S, "project": S, "agent": S, "note": S, "estimated_seconds": N,
-          "timeout_seconds": N, "submission_key": S, "env": {"type": "object"}, "start_before": N,
+          "timeout_seconds": {"type": ["number", "string"]}, "submission_key": S, "env": {"type": "object"}, "start_before": N,
           "retry": {"type": "object", "description": "{max_attempts, backoff_seconds, exit_codes[], reasons[timed_out|signal]}"}},
          ("name", "cmd", "cwd")),
     tool("gpu_status", "One job, compact (<1KB). status: queued|held|running|succeeded|failed|canceled|timed_out|"
@@ -37,8 +38,8 @@ TOOLS = [
          {"id": S, "tail": I, "since": I, "attempt": I}, ("id",)),
     tool("gpu_control", "Control a job. op: cancel (running: TERM, 5s, KILL, cleanup verified) | hold | release "
          "(accept_drift to run changed source) | reorder (before/after/first/last among your own jobs) | run_next "
-         "(operator only, needs reason) | timeout (seconds; running = absolute from start, > elapsed) | rerun | ack.",
-         {"id": S, "op": S, "reason": S, "before": S, "after": S, "first": B, "last": B, "seconds": N,
+         "(operator only, needs reason) | timeout (seconds, or 0/\"none\" for no limit; running = absolute from start, > elapsed) | rerun | ack.",
+         {"id": S, "op": S, "reason": S, "before": S, "after": S, "first": B, "last": B, "seconds": {"type": ["number", "string"]},
           "accept_drift": B}, ("id", "op")),
     tool("gpu_overview", "GPU idle/running/paused/attention, active job, queue order, recent results.",
          {"project": S, "agent": S}),

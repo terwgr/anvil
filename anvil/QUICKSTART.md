@@ -11,13 +11,14 @@ directly. One job runs at a time, fairly shared. Don't wait idle: submit, keep w
     anvil wait j12 --until-done --timeout 3600     # run in the background if your tools allow it
     anvil logs j12 --tail 4000                     # then check output and your result files
 
-`-e` your runtime guess (seconds, advisory; a rough guess is fine) · `-t` hard time limit from launch (default 300) ·
+`-e` your runtime guess (seconds, advisory; a rough guess is fine) · `-t` optional hard time limit from launch (default none) ·
 `-n` short name · `--note` why. All output is compact JSON; errors are `{"error":..,"message":..}`, exit 1.
 The person sees the same queue in the Anvil menu bar app and may hold, reorder or stop your jobs.
 
 ## Details
 - Project defaults to the git repo name, else the folder name; cwd, PATH and venv are captured.
-- `-t` timeout is a hard limit from launch (default 300s); queue wait doesn't count. `-e` is advisory only.
+- `-t` is a hard limit from launch (default none; `-t 0` removes one); queue wait doesn't count. Set it when
+  a hang must not hold the GPU. `-e` is advisory only.
 - `--key K` makes the submit idempotent: repeating it returns the original job.
 - Retries are opt-in: `--max-attempts 3 --retry-codes 75 --retry-on timed_out --backoff 30`.
 If your tools run commands in a sandbox, run `anvil` with permission to leave it: the service lives in
