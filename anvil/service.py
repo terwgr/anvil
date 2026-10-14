@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS jobs(
  signal INTEGER, reason TEXT, progress TEXT, order_key REAL, wait_accum REAL DEFAULT 0, elig_since REAL,
  run_next_at REAL, run_next_by TEXT, run_next_reason TEXT, position INTEGER, est_wait REAL, pgid INTEGER,
  acked INTEGER DEFAULT 0, logs_removed INTEGER DEFAULT 0, term_s REAL, cleanup_s REAL,
- hidden INTEGER DEFAULT 0);  -- hidden: removed from views; the compact receipt stays
+ hidden INTEGER DEFAULT 0,  -- hidden: removed from views; the compact receipt stays
+ reported INTEGER DEFAULT 0);  -- reported: a wait has returned this finished job
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
 CREATE TABLE IF NOT EXISTS attempts(job_id TEXT, n INTEGER, started REAL, finished REAL, pgid INTEGER,
  exit_code INTEGER, signal INTEGER, status TEXT, reason TEXT, timeout REAL, term_s REAL, cleanup_s REAL,
@@ -42,6 +43,44 @@ CREATE TABLE IF NOT EXISTS hooks(id INTEGER PRIMARY KEY AUTOINCREMENT, agent TEX
 CREATE TABLE IF NOT EXISTS deliveries(event_id INTEGER, hook TEXT, tries INTEGER DEFAULT 0, next_at REAL,
  done INTEGER DEFAULT 0, err TEXT, PRIMARY KEY(event_id, hook));
 """
+
+
+def _m1(db):  # version-0 databases predate versioning; only the earliest of them lack `hidden`
+    if "hidden" not in {r[1] for r in db.execute("PRAGMA table_info(jobs)")}:
+        db.execute("ALTER TABLE jobs ADD COLUMN hidden INTEGER DEFAULT 0")
+
+
+def _m2(db):  # jobs that finished before waits tracked delivery count as reported
+    db.execute("ALTER TABLE jobs ADD COLUMN reported INTEGER DEFAULT 0")
+    db.execute(f"UPDATE jobs SET reported=1 WHERE status IN ({','.join('?' * len(FINAL))})", FINAL)
+
+
+# Schema upgrades for existing databases, in order; PRAGMA user_version records the last one applied.
+# New databases get SCHEMA directly at the latest version.
+MIGRATIONS = [_m1, _m2]
+
+
+def open_db(path):
+    db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+    fresh = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone() is None
+    db.executescript(SCHEMA)  # creates the whole schema when fresh, and tables added later otherwise
+    if fresh:
+        db.execute(f"PRAGMA user_version={len(MIGRATIONS)}")
+        return db
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    for n, migrate in enumerate(MIGRATIONS[version:], version + 1):
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            migrate(db)
+            db.execute(f"PRAGMA user_version={n}")
+            db.execute("COMMIT")
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
+    return db
 
 
 class Err(Exception):
@@ -104,11 +143,7 @@ class Service:
         self.home = config.home()
         (self.home / "logs").mkdir(exist_ok=True)
         (self.home / "results").mkdir(exist_ok=True)
-        self.db = sqlite3.connect(self.home / "anvil.db", check_same_thread=False, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=NORMAL")
-        self.db.executescript(SCHEMA)
+        self.db = open_db(self.home / "anvil.db")
         self.L = threading.RLock()
         self.kick_cv = threading.Condition(self.L)
         self.ev_cv = threading.Condition()
