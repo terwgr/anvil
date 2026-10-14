@@ -531,8 +531,10 @@ struct JobRow: View {
     @ViewBuilder var trailing: some View {
         if job.status == "running" {
             TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                Text(fmt((job.n("elapsed_s") ?? 0) + ctx.date.timeIntervalSince(store.fetchedAt)) + " / " + fmt(job.n("timeout_s")))
+                Text(fmt((job.n("elapsed_s") ?? 0) + ctx.date.timeIntervalSince(store.fetchedAt))
+                     + (job.n("est_s").map { " / ~" + fmt($0) } ?? ""))
             }
+            .help("Running time / agent's estimate · hard limit " + (job.n("timeout_s").map(fmt) ?? "none"))
         } else if job.status == "queued", let w = job.n("approx_wait_s") {
             Text("~" + fmt(w)).help("Approximate wait, from agent estimates")
         } else if final {
