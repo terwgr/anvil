@@ -16,9 +16,19 @@ anvil install
 ```
 
 The first command puts `anvil` and `anvil-mcp` on your PATH. The second builds the menu bar app into
-`~/Applications/Anvil.app` (Swift/AppKit, compiled locally with Xcode's `swiftc`) and starts both the
-service and the app at login (`anvil uninstall` removes the login items). Without it, any `anvil` command
-or the app starts the service on demand.
+`~/Applications/Anvil.app` (Swift/AppKit, compiled locally with Xcode's `swiftc`) and adds the
+`anvil-mcp` server to Claude Code and Codex if they are installed. Nothing starts at login: the first
+`anvil` command or MCP call starts the service, and the menu bar app appears with it.
+`anvil uninstall` quits and removes the app and the MCP entries.
+
+To add the MCP server yourself (or to another client, as a stdio server running `anvil-mcp`):
+
+```bash
+claude mcp add --scope user anvil -- anvil-mcp
+```
+```bash
+codex mcp add anvil -- anvil-mcp
+```
 
 ## Use
 
@@ -37,7 +47,7 @@ anvil submit -n train -e 120 -t 900 -- python3 train.py
   `anvil app` opens it.
 - `anvil top` — live terminal view; `anvil view` — one-shot.
 - Agents: tell any agent "use Anvil for the GPU". Running `anvil` (or `anvil help`) prints its guide ([anvil/QUICKSTART.md](anvil/QUICKSTART.md)).
-- MCP: add `anvil-mcp` as a stdio server with `ANVIL_AGENT=<id>` in its environment.
+- MCP: agents get `gpu_submit`, `gpu_wait`, `gpu_logs` and the rest; they pass `agent` on submit.
 
 Route each project's GPU entrypoint through `anvil submit`; work started outside Anvil is detected
 best-effort and shown, never killed.

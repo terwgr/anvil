@@ -111,6 +111,7 @@ def serve():
     os.umask(old)
     svc.start()
     print(f"anvil serving {path}", flush=True)
+    config.show_app()  # the menu bar app appears whenever the service runs, however it was started
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

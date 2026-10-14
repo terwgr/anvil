@@ -252,44 +252,49 @@ def cmd_app(a):
     out({"app": str(APP)})
 
 
-def launch_agent(label, args, keepalive):
-    log = config.home() / "service.log"
-    p = AGENTS / f"{label}.plist"
-    AGENTS.mkdir(parents=True, exist_ok=True)
-    argv = "".join(f"<string>{x}</string>" for x in args)
-    p.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>{label}</string>
-<key>ProgramArguments</key><array>{argv}</array>
-<key>WorkingDirectory</key><string>{ROOT}</string>
-<key>EnvironmentVariables</key><dict><key>ANVIL_HOME</key><string>{config.home()}</string></dict>
-<key>RunAtLoad</key><true/><key>KeepAlive</key>{"<true/>" if keepalive else "<false/>"}
-<key>StandardOutPath</key><string>{log}</string><key>StandardErrorPath</key><string>{log}</string>
-</dict></plist>
-""")
-    uid = os.getuid()
-    subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(p)], capture_output=True)
-    return subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(p)], capture_output=True, text=True)
-
-
-def cmd_install(a):
-    build_app()
-    s = launch_agent("dev.anvil.queue", [sys.executable, "-m", "anvil", "serve"], True)
-    m = launch_agent("dev.anvil.app", [str(APP / "Contents/MacOS/Anvil")], False)
-    out({"service": s.returncode == 0, "app": str(APP), "menu_bar": m.returncode == 0,
-         "message": (s.stderr + m.stderr).strip() or None})
-
-
-def cmd_uninstall(a):
+def remove_login_items():
+    """Older versions started the service and app at login; Anvil now starts only when something uses it."""
     for label in ("dev.anvil.app", "dev.anvil.queue"):
         p = AGENTS / f"{label}.plist"
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(p)], capture_output=True)
         p.unlink(missing_ok=True)
-    out({"uninstalled": True, "app_left_in_place": str(APP)})
+
+
+# Agent apps that get the anvil-mcp server: (remove command, add command) for each app's own CLI.
+MCP_CLIENTS = {"claude": (["claude", "mcp", "remove", "--scope", "user", "anvil"],
+                          ["claude", "mcp", "add", "--scope", "user", "anvil", "--"]),
+               "codex": (["codex", "mcp", "remove", "anvil"], ["codex", "mcp", "add", "anvil", "--"])}
+
+
+def register_mcp(add):
+    """Register (or remove) anvil-mcp in Claude Code and Codex where they are installed."""
+    exe = shutil.which("anvil-mcp") or str(Path(sys.executable).with_name("anvil-mcp"))
+    done = {}
+    for name, (rm, mk) in MCP_CLIENTS.items():
+        if not shutil.which(name):
+            done[name] = "not installed"
+            continue
+        subprocess.run(rm, capture_output=True)  # re-adding refreshes the path after a reinstall
+        r = subprocess.run(mk + [exe], capture_output=True, text=True) if add else None
+        done[name] = (r.returncode == 0 or (r.stderr or r.stdout).strip()[-300:]) if add else "removed"
+    return done
+
+
+def cmd_install(a):
+    build_app()
+    out({"app": str(APP), "mcp": register_mcp(True)})
+
+
+def cmd_uninstall(a):
+    remove_login_items()
+    register_mcp(False)
+    subprocess.run(["osascript", "-e", 'quit app id "dev.anvil.app"'], capture_output=True)
+    shutil.rmtree(APP, ignore_errors=True)
+    out({"uninstalled": True, "removed": str(APP)})
 
 
 def main(argv=None):
+    remove_login_items()
     p = argparse.ArgumentParser(prog="anvil", description="Local fair GPU queue. Output is compact JSON.")
     p.add_argument("--actor", help="who is acting (default $ANVIL_AGENT or 'human')")
     sp = p.add_subparsers(dest="cmd_name", required=True)
@@ -397,8 +402,8 @@ def main(argv=None):
     s.add_argument("--build", action="store_true", help="rebuild from anvil/Anvil.swift")
     sub("quickstart", lambda a: print(Path(__file__).with_name("QUICKSTART.md").read_text()), "agent quick-start")
     sub("serve", lambda a: __import__("anvil.server").server.serve(), "run the service in the foreground")
-    sub("install", cmd_install, "build the app; run service + menu bar app at login")
-    sub("uninstall", cmd_uninstall, "remove the launchd service")
+    sub("install", cmd_install, "build the menu bar app; add anvil-mcp to Claude Code and Codex")
+    sub("uninstall", cmd_uninstall, "quit and remove the menu bar app and the MCP entries")
 
     args = sys.argv[1:] if argv is None else argv
     if not args or args[0] in ("-h", "--help", "help"):  # the guide is the help: an agent told "use anvil" starts here

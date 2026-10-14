@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path
 
 DEFAULTS = {
@@ -20,6 +21,9 @@ DEFAULTS = {
     # Global hooks: [{"command": "...", "agents": ["*"]}]; receipt JSON is passed on stdin.
     "hooks": [],
 }
+
+
+APP = Path.home() / "Applications/Anvil.app"
 
 
 def home() -> Path:
@@ -48,3 +52,13 @@ def sock() -> Path:
     if len(str(p)) <= 100:
         return p
     return Path(f"/tmp/anvil-{os.getuid()}-{hashlib.sha1(str(home()).encode()).hexdigest()[:10]}.sock")
+
+
+def show_app():
+    """Open the menu bar app in the background if it is built for this ANVIL_HOME. No-op when already open."""
+    try:
+        built_for = json.loads((APP / "Contents/Resources/service.json").read_text())["home"]
+    except (OSError, ValueError, KeyError):
+        return
+    if Path(built_for) == home():
+        subprocess.Popen(["open", "-g", str(APP)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
