@@ -34,6 +34,8 @@ func call(_ method: String, _ path: String, _ body: [String: Any]? = nil, timeou
     defer { close(fd) }
     var tv = timeval(tv_sec: timeout, tv_usec: 0)
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    var one: Int32 = 1  // a service that closes mid-request must not kill the app with SIGPIPE
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
     let p = Array(ServiceInfo.shared.socket.utf8)
@@ -44,7 +46,11 @@ func call(_ method: String, _ path: String, _ body: [String: Any]? = nil, timeou
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
     }
     guard rc == 0 else { throw APIError(message: "Anvil service is not running") }
-    let payload = body.flatMap { try? JSONSerialization.data(withJSONObject: $0) } ?? Data()
+    var payload = Data()
+    if let body {
+        guard let d = try? JSONSerialization.data(withJSONObject: body) else { throw APIError(message: "couldn't encode the request") }
+        payload = d
+    }
     var req = Data("\(method) \(path) HTTP/1.0\r\nHost: anvil\r\nContent-Type: application/json\r\nContent-Length: \(payload.count)\r\n\r\n".utf8)
     req.append(payload)
     var sent = 0
@@ -63,7 +69,9 @@ func call(_ method: String, _ path: String, _ body: [String: Any]? = nil, timeou
     guard let sep = resp.range(of: Data("\r\n\r\n".utf8)) else { throw APIError(message: "no response") }
     let head = String(decoding: resp[..<sep.lowerBound], as: UTF8.self)
     let status = Int(head.split(separator: " ").dropFirst().first ?? "") ?? 0
-    let obj = try JSONSerialization.jsonObject(with: resp[sep.upperBound...])
+    guard let obj = try? JSONSerialization.jsonObject(with: resp[sep.upperBound...]) else {
+        throw APIError(message: status == 0 ? "no response from the service (busy?)" : "unreadable response (\(status))")
+    }
     if status >= 400 {
         throw APIError(message: (obj as? [String: Any])?["message"] as? String ?? "error \(status)")
     }
@@ -73,7 +81,8 @@ func call(_ method: String, _ path: String, _ body: [String: Any]? = nil, timeou
 func q(_ items: [String: String?]) -> String {
     var c = URLComponents()
     c.queryItems = items.compactMap { k, v in v.map { URLQueryItem(name: k, value: $0) } }
-    return c.queryItems!.isEmpty ? "" : "?" + (c.percentEncodedQuery ?? "")
+    // URLComponents leaves "+" alone, which the server reads as a space ("c++bench" would filter to nothing)
+    return c.queryItems!.isEmpty ? "" : "?" + (c.percentEncodedQuery ?? "").replacingOccurrences(of: "+", with: "%2B")
 }
 
 // MARK: - Model
@@ -128,6 +137,10 @@ final class Store: ObservableObject {
     @Published var connected = false
     @Published var fetchedAt = Date()
     @Published var message: String?
+    @Published var messageIsError = false
+    /// One pending confirmation (stop, clear), shown above the list: (question, button, action).
+    @Published var confirm: (text: String, button: String, action: () -> Void)?
+    @Published var attention: [[String: Any]] = []
     @Published var pinned = false { didSet { onPin?(pinned) } }
     // Row reordering, driven by the panel's own mouse tracking (see Panel.sendEvent).
     @Published var dragID: String?
@@ -146,9 +159,11 @@ final class Store: ObservableObject {
     @Published var expanded: String?
     @Published var detail: [String: Any]?
     @Published var log = ""
-    @Published var project: String? { didSet { older = []; olderNext = nil; refresh() } }
-    @Published var agent: String? { didSet { older = []; olderNext = nil; refresh() } }
-    nonisolated(unsafe) var cursor: Int?  // read by the poller thread; written on main
+    @Published var project: String? { didSet { gen += 1; older = []; olderNext = nil; refresh() } }
+    @Published var agent: String? { didSet { gen += 1; older = []; olderNext = nil; refresh() } }
+    nonisolated(unsafe) var cursor: Int?  // bootstrap for the poller, which then follows the wait replies' cursors
+    nonisolated(unsafe) var fastPoll = false  // an expanded running job: refresh its log every 2s
+    private var gen = 0, inFlight = false, dirty = false
     var onChange: (() -> Void)?
     private var lastStart = Date.distantPast
 
@@ -157,18 +172,22 @@ final class Store: ObservableObject {
 
     func start() {
         Thread.detachNewThread { [weak self] in
+            var cur: Int?
             while true {
                 guard let self else { return }
-                let cur = self.cursor
+                if cur == nil { cur = self.cursor }
                 do {
-                    if let cur {
-                        _ = try call("GET", "/api/wait" + q(["cursor": String(cur), "timeout": "25"]), timeout: 35)
+                    if let c = cur {
+                        let t = self.fastPoll ? 2 : 25
+                        let r = try call("GET", "/api/wait" + q(["cursor": String(c), "timeout": String(t)]), timeout: t + 10)
+                        cur = ((r as? [String: Any])?["cursor"] as? NSNumber)?.intValue ?? c  // never re-read the same events
                     } else {
                         _ = try call("GET", "/api/health")
                     }
                     DispatchQueue.main.async { self.refresh() }
                     if cur == nil { Thread.sleep(forTimeInterval: 0.5) }
                 } catch {
+                    cur = nil
                     DispatchQueue.main.async { self.connected = false; self.cursor = nil; self.onChange?(); self.ensureService() }
                     Thread.sleep(forTimeInterval: 2)
                 }
@@ -196,9 +215,13 @@ final class Store: ObservableObject {
         try? p.run()
     }
 
+    /// One overview request in flight at a time; a refresh asked for meanwhile runs right after, and a reply
+    /// from before a filter change is dropped, so an older snapshot never overwrites a newer one.
     func refresh() {
+        if inFlight { dirty = true; return }
+        inFlight = true
         let path = "/api/overview" + q(["project": project, "agent": agent])
-        let exp = expanded
+        let exp = expanded, g = gen
         DispatchQueue.global().async {
             let o = try? call("GET", path) as? [String: Any]
             var det: [String: Any]?, log: String?
@@ -207,6 +230,9 @@ final class Store: ObservableObject {
                 log = (try? call("GET", "/api/jobs/\(exp)/logs?tail=6000") as? [String: Any])?["data"] as? String
             }
             DispatchQueue.main.async {
+                self.inFlight = false
+                defer { if self.dirty { self.dirty = false; self.refresh() } }
+                guard g == self.gen else { self.dirty = true; return }
                 guard let o else { self.connected = false; self.onChange?(); return }
                 self.connected = true
                 self.fetchedAt = Date()
@@ -217,8 +243,10 @@ final class Store: ObservableObject {
                 self.outside = o["outside"] as? [[String: Any]] ?? []
                 self.projects = o["projects"] as? [String] ?? []
                 self.agents = o["agents"] as? [String] ?? []
+                self.attention = o["attention"] as? [[String: Any]] ?? []
                 self.cursor = (o["cursor"] as? NSNumber)?.intValue
                 if exp == self.expanded, let det { self.detail = det; self.log = log ?? "" }
+                self.fastPoll = self.expanded != nil && self.queue.contains { $0.id == self.expanded && $0.status == "running" }
                 self.onChange?()
             }
         }
@@ -228,10 +256,15 @@ final class Store: ObservableObject {
         var b = body
         b["actor"] = "panel"
         DispatchQueue.global().async {
-            do { _ = try call("POST", path, b) } catch let e as APIError {
-                DispatchQueue.main.async { self.flash(e.message) }
-            } catch {}
-            DispatchQueue.main.async { self.refresh() }
+            do { _ = try call("POST", path, b, timeout: 30) } catch let e as APIError {
+                DispatchQueue.main.async { self.flash(e.message, error: true) }
+            } catch {
+                DispatchQueue.main.async { self.flash("\(error)", error: true) }
+            }
+            DispatchQueue.main.async {
+                if !self.older.isEmpty { self.older = []; self.olderNext = nil; self.loadOlder() }  // drop removed rows
+                self.refresh()
+            }
         }
     }
 
@@ -243,26 +276,62 @@ final class Store: ObservableObject {
         refresh()
     }
 
-    func flash(_ m: String) {
-        message = m
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { if self.message == m { self.message = nil } }
+    func flash(_ m: String, error: Bool = false) {
+        message = m; messageIsError = error
+        DispatchQueue.main.asyncAfter(deadline: .now() + (error ? 8 : 4)) { if self.message == m { self.message = nil } }
     }
 
-    /// Drop a pending job at index `i` of the visible queue. The service orders projects and agents fairly, so
-    /// a drag can reorder one agent's own jobs, or move a job to the top (an explicit, visible run-next).
+    func ask(_ text: String, _ button: String, _ action: @escaping () -> Void) { confirm = (text, button, action) }
+
+    func stop(_ j: Job) {
+        ask("Stop \(j.name) (\(j.id), running \(fmt(j.n("elapsed_s"))))?", "Stop") { self.control(j.id, "cancel") }
+    }
+
+    /// Drop a pending job at index `i` of the visible queue. Next to the same agent's jobs it only reorders them
+    /// (fair sharing continues); anywhere else the service pins the jobs above it in the order shown (visible
+    /// "next"), or, below every other queued job, moves it to the back. Held rows don't count as places.
     func move(_ id: String, to i: Int) {
         let jobs = pendingJobs
         guard let from = jobs.firstIndex(where: { $0.id == id }), i != from, i != from + 1 else { return }
         let j = jobs[from]
-        func same(_ o: Job) -> Bool { o.id != id && o.project == j.project && o.agent == j.agent }
-        if i == 0 {
-            control(id, "run_next", ["reason": "moved to front in the Anvil panel"])
-        } else if i < jobs.count, same(jobs[i]) {
-            control(id, "reorder", ["before": jobs[i].id])
-        } else if same(jobs[i - 1]) {
-            control(id, "reorder", ["after": jobs[i - 1].id])
+        guard j.status == "queued" else { flash("\(id) is held: release it before moving it", error: true); return }
+        func same(_ o: Job) -> Bool { o.project == j.project && o.agent == j.agent }
+        let others = jobs.filter { $0.status == "queued" && $0.id != id }
+        let k = jobs[..<i].filter { $0.status == "queued" && $0.id != id }.count  // queued jobs that stay above it
+        if others.isEmpty { return }
+        if k == 0 {
+            if same(others[0]) { control(id, "reorder", ["before": others[0].id]) }
+            else { control(id, "move", ["before": others[0].id]) }
+        } else if k >= others.count {
+            if same(others[k - 1]) { control(id, "reorder", ["after": others[k - 1].id]) }
+            else { control(id, "move", ["last": true]) }
+        } else if same(others[k]) {
+            control(id, "reorder", ["before": others[k].id])
+        } else if same(others[k - 1]) {
+            control(id, "reorder", ["after": others[k - 1].id])
         } else {
-            flash("Projects and agents share the GPU fairly. Drag within one agent's jobs, or to the top to run next.")
+            control(id, "move", ["before": others[k].id])
+        }
+    }
+
+    func clearQueue() {
+        let n = pendingJobs.count
+        ask("Cancel \(n) queued or held job\(n == 1 ? "" : "s")\(project.map { " in " + $0 } ?? "")\(agent.map { " from " + $0 } ?? "")? Their agents are told.",
+            "Clear Queue") {
+            self.act("/api/clear", ["project": self.project as Any, "agent": self.agent as Any, "queue": true])
+        }
+    }
+
+    func clearFinished() {
+        ask("Remove all finished jobs from the list? Their logs are deleted.", "Clear Finished") {
+            self.act("/api/clear", ["project": self.project as Any, "agent": self.agent as Any])
+        }
+    }
+
+    /// Acknowledge every failure behind "Needs Attention" (drift holds need a release or cancel instead).
+    func dismissAll() {
+        for a in attention where (a["status"] as? String).map(failed.contains) == true {
+            if let id = a["id"] as? String { control(id, "ack") }
         }
     }
 
@@ -270,7 +339,10 @@ final class Store: ObservableObject {
         let path = "/api/jobs" + q(["status": "succeeded,failed,canceled,timed_out,interrupted", "limit": "20",
                                     "project": project, "agent": agent, "after": olderNext ?? recent.last?.id])
         DispatchQueue.global().async {
-            guard let r = try? call("GET", path) as? [String: Any] else { return }
+            guard let r = try? call("GET", path) as? [String: Any] else {
+                DispatchQueue.main.async { self.flash("Couldn't load older jobs", error: true) }
+                return
+            }
             DispatchQueue.main.async {
                 let seen = Set((self.recent + self.older).map(\.id))
                 self.older += (r["jobs"] as? [[String: Any]] ?? []).map(Job.init).filter { !seen.contains($0.id) }
@@ -310,6 +382,11 @@ struct HeightKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
+struct NoticeHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 struct RowFrames: PreferenceKey {
     static let defaultValue: [String: CGRect] = [:]
     static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
@@ -321,19 +398,24 @@ struct PanelView: View {
     @ObservedObject var store: Store
     var onHeight: (CGFloat) -> Void
     @State private var showAllRecent = false
+    @State private var contentHeight: CGFloat = 0
+    @State private var noticeHeight: CGFloat = 0
 
     static let chrome: CGFloat = 28 + 24  // header + footer
 
     var body: some View {
         VStack(spacing: 0) {
             header
+            VStack(spacing: 0) { notices }  // above the list, so they never scroll out of sight
+                .background(GeometryReader { Color.clear.preference(key: NoticeHeightKey.self, value: $0.size.height) })
             ScrollView {
                 content.background(GeometryReader { Color.clear.preference(key: HeightKey.self, value: $0.size.height) })
             }
             .scrollBounceBehavior(.basedOnSize)
             footer
         }
-        .onPreferenceChange(HeightKey.self) { onHeight($0 + Self.chrome) }
+        .onPreferenceChange(HeightKey.self) { contentHeight = $0; onHeight($0 + noticeHeight + Self.chrome) }
+        .onPreferenceChange(NoticeHeightKey.self) { noticeHeight = $0; onHeight(contentHeight + $0 + Self.chrome) }
     }
 
     var header: some View {
@@ -355,13 +437,6 @@ struct PanelView: View {
 
     @ViewBuilder var content: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if !store.connected { notice("Service not reachable — reconnecting…", .red) }
-            if let m = store.message { notice(m, .blue) }
-            if !store.outside.isEmpty {
-                notice("Outside GPU work: " + store.outside.prefix(2)
-                    .map { ($0["cmd"] as? String ?? "").split(separator: " ").first.map { ($0 as NSString).lastPathComponent } ?? "" }
-                    .joined(separator: ", "), .orange)
-            }
             if let r = store.running { JobRow(job: r, store: store) }
             queue
             if store.running == nil && store.pendingJobs.isEmpty && store.connected {
@@ -425,8 +500,13 @@ struct PanelView: View {
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
             Spacer()
             Menu {
-                Button("Clear Finished") { store.act("/api/clear", ["project": store.project as Any, "agent": store.agent as Any]) }
-                    .disabled(store.recent.isEmpty)
+                Button("Clear Finished…") { store.clearFinished() }
+                    .disabled(store.recent.isEmpty && store.older.isEmpty)
+                Button("Clear Queue…") { store.clearQueue() }
+                    .disabled(store.pendingJobs.isEmpty)
+                if !store.attention.isEmpty {
+                    Button("Dismiss All Failures") { store.dismissAll() }
+                }
                 Button("Open Data Folder") { NSWorkspace.shared.open(URL(fileURLWithPath: ServiceInfo.shared.home)) }
                 Divider()
                 Button("Quit Anvil") { NSApp.terminate(nil) }
@@ -441,8 +521,58 @@ struct PanelView: View {
         [store.project, store.agent].compactMap { $0 }.joined(separator: " · ").nilIfEmpty ?? "All work"
     }
 
+    @ViewBuilder var notices: some View {
+        if !store.connected { notice("Service not reachable — reconnecting…", .red) }
+        if let m = store.message { notice(m, store.messageIsError ? .red : .blue) }
+        if let c = store.confirm {
+            HStack(spacing: 6) {
+                Text(c.text).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Button("Cancel") { store.confirm = nil }.keyboardShortcut(.cancelAction)
+                Button(c.button, role: .destructive) { store.confirm = nil; c.action() }
+            }
+            .controlSize(.small).font(.system(size: 11))
+            .padding(.horizontal, 12).padding(.vertical, 4)
+        }
+        if store.gpu == "attention" && !store.attention.isEmpty { attentionNotice }
+        if !store.outside.isEmpty {
+            notice("Outside GPU work (\(store.outside.count)): " + store.outside.prefix(3)
+                .map { o in
+                    let name = (o["cmd"] as? String ?? "").split(separator: " ").first.map { ($0 as NSString).lastPathComponent } ?? ""
+                    return name + ((o["pid"] as? NSNumber).map { " (pid \($0))" } ?? "")
+                }
+                .joined(separator: ", "), .orange)
+        }
+    }
+
+    /// What "Needs Attention" is about, across all projects, and how to clear it.
+    var attentionNotice: some View {
+        let items = store.attention
+        let ackable = items.filter { ($0["status"] as? String).map(failed.contains) == true }
+        return VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(items.prefix(3).enumerated()), id: \.offset) { _, a in
+                let id = a["id"] as? String ?? ""
+                Text("\(id) \(a["name"] as? String ?? "") · \(a["agent"] as? String ?? ""): \(a["why"] as? String ?? "")")
+                    .font(.system(size: 11)).foregroundStyle(.red).lineLimit(1).truncationMode(.middle)
+                    .help("To clear: \(a["clear"] as? String ?? "")")
+            }
+            HStack(spacing: 6) {
+                Text(items.count > 3 ? "and \(items.count - 3) more" : "Needs attention")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                Spacer()
+                if !ackable.isEmpty {
+                    Button("Dismiss \(ackable.count == 1 ? "failure" : "\(ackable.count) failures")") { store.dismissAll() }
+                        .help("Acknowledge: the jobs stay in the list; held jobs still need Release or Cancel")
+                }
+            }
+            .controlSize(.small).font(.system(size: 11))
+        }
+        .padding(.horizontal, 12).padding(.vertical, 4)
+    }
+
     func notice(_ t: String, _ c: Color) -> some View {
-        Text(t).font(.system(size: 11)).lineLimit(2).foregroundStyle(c)
+        Text(t).font(.system(size: 11)).lineLimit(3).foregroundStyle(c).textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 12).padding(.vertical, 3)
     }
 }
@@ -493,9 +623,7 @@ struct JobRow: View {
             .padding(.horizontal, 6)
             .contentShape(Rectangle())
             .onTapGesture { store.toggle(job.id) }
-            if job.status == "running", let f = job.progress?["fraction"] as? Double {
-                ProgressView(value: min(1, max(0, f))).controlSize(.mini).padding(.horizontal, 26).padding(.bottom, 3)
-            }
+            if job.status == "running" { timeBar }
             if open { detail.padding(.leading, 26).padding(.trailing, 6).padding(.bottom, 6) }
         }
         .background(RoundedRectangle(cornerRadius: 5).fill(open ? Color.primary.opacity(0.06)
@@ -503,18 +631,48 @@ struct JobRow: View {
         .padding(.horizontal, 4)
         .onHover { hover = $0 }
         .contextMenu { menu }
-        .help(job.s("note") ?? "")
+        .help(tooltip)
+    }
+
+    /// Everything that tells jobs apart: shown on hover (the row's grey text switches to it) and as a tooltip.
+    var tooltip: String {
+        var l = ["\(job.id) · \(job.status) · \(job.agent) · \(job.project)"]
+        if let w = job.s("why") { l.append(w) }
+        if let r = job.d["run_next"] as? [String: Any] { l.append("run next: \(r["reason"] as? String ?? "") (\(r["by"] as? String ?? ""))") }
+        l.append("est. \(job.n("est_s").map(fmt) ?? "unknown") · limit \(job.n("timeout_s").map(fmt) ?? "none")")
+        if let n = job.s("note") { l.append(n) }
+        return l.joined(separator: "\n")
     }
 
     var meta: String {
         var p: [String] = []
+        if hover && !open { p += [job.id, job.agent] }
         if job.status == "running", let m = job.progress?["message"] as? String { p.append(m) }
         p.append(job.project)
         if job.status == "held" { p.append(job.s("why") ?? "held") }
         if job.d["run_next"] != nil { p.append("next") }
+        if job.d["run_last"] != nil { p.append("last") }
+        if job.d["acked"] as? Bool == false { p.append("unacknowledged") }
         if final && job.status != "succeeded" { p.append(job.s("reason") ?? job.status) }
         if let sub = job.s("sub") { p.append(sub) }
         return p.joined(separator: " · ")
+    }
+
+    /// Running time against the agent's estimate (full at the estimate, orange past it); without an estimate,
+    /// the job's own reported progress fraction.
+    @ViewBuilder var timeBar: some View {
+        if let est = job.n("est_s"), est > 0 {
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                let el = (job.n("elapsed_s") ?? 0) + ctx.date.timeIntervalSince(store.fetchedAt)
+                ProgressView(value: min(1, max(0, el / est))).controlSize(.mini)
+                    .tint(el > est ? .orange : .accentColor)
+                    .help(el > est ? "Past the agent's estimate by \(fmt(el - est))" : "Running time / agent's estimate")
+            }
+            .padding(.horizontal, 26).padding(.bottom, 3)
+        } else if let f = job.progress?["fraction"] as? Double {
+            ProgressView(value: min(1, max(0, f))).controlSize(.mini).padding(.horizontal, 26).padding(.bottom, 3)
+                .help("Progress reported by the job")
+        }
     }
 
     @ViewBuilder var leading: some View {
@@ -544,12 +702,13 @@ struct JobRow: View {
 
     var removeButton: some View {
         Button {
-            store.control(job.id, job.status == "running" ? "cancel" : "remove")
+            if job.status == "running" { store.stop(job) } else { store.control(job.id, "remove") }
         } label: {
             Image(systemName: job.status == "running" ? "stop.circle.fill" : "xmark.circle.fill").foregroundStyle(.secondary)
         }
         .buttonStyle(.borderless).font(.system(size: 12))
-        .help(job.status == "running" ? "Stop" : job.pending ? "Cancel and remove" : "Remove from list")
+        .help(job.status == "running" ? "Stop (asks first)" : job.pending ? "Cancel and remove (its agent is told)"
+              : "Remove from list (deletes its logs)")
     }
 
     @ViewBuilder var menu: some View {
@@ -564,18 +723,34 @@ struct JobRow: View {
                 store.control(job.id, "release", drift ? ["accept_drift": true] : [:])
             }
         }
+        if job.d["run_next"] != nil || job.d["run_last"] != nil {
+            Button("Unpin (back to fair order)") { store.control(job.id, "unpin") }
+        }
         if final {
             Button("Rerun") { store.control(job.id, "rerun") }
+            if job.d["acked"] as? Bool == false { Button("Dismiss Failure") { store.control(job.id, "ack") } }
             Button("Show Results") {
-                NSWorkspace.shared.open(URL(fileURLWithPath: ServiceInfo.shared.home + "/results/" + job.id))
+                let dir = ServiceInfo.shared.home + "/results/" + job.id
+                if FileManager.default.fileExists(atPath: dir) { NSWorkspace.shared.open(URL(fileURLWithPath: dir)) }
+                else { store.flash("\(job.id) wrote no results", error: true) }
             }
+        }
+        if job.n("attempt") != nil || job.status == "running" || final {
+            Button("Open Log") { openLog() }
         }
         Button("Copy Job ID") {
             NSPasteboard.general.clearContents(); NSPasteboard.general.setString(job.id, forType: .string)
         }
         Divider()
-        if s == "running" { Button("Stop", role: .destructive) { store.control(job.id, "cancel") } }
+        if s == "running" { Button("Stop…", role: .destructive) { store.stop(job) } }
         else { Button(job.pending ? "Cancel and Remove" : "Remove", role: .destructive) { store.control(job.id, "remove") } }
+    }
+
+    func openLog() {
+        let n = job.n("attempt").map { Int($0) } ?? 1
+        let f = ServiceInfo.shared.home + "/logs/\(job.id)/\(n).log"
+        if FileManager.default.fileExists(atPath: f) { NSWorkspace.shared.open(URL(fileURLWithPath: f)) }
+        else { store.flash("No log for \(job.id) (removed, or it never started)", error: true) }
     }
 
     @ViewBuilder var detail: some View {
@@ -589,7 +764,9 @@ struct JobRow: View {
                 if let r = d["results"] as? [String], !r.isEmpty { line("results: " + r.prefix(3).joined(separator: ", ")) }
             }
             if !store.log.isEmpty {
-                Text(store.log.split(separator: "\n").suffix(4).joined(separator: "\n"))
+                Text(store.log.replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n")
+                        .map { $0.split(separator: "\r", omittingEmptySubsequences: false).last.map(String.init) ?? "" }  // progress bars redraw with \r
+                        .suffix(4).joined(separator: "\n"))
                     .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
                     .lineLimit(4).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(4)
@@ -631,7 +808,10 @@ struct JobRow: View {
             if job.pending || s == "running" {
                 TextField("none", text: $limit).frame(width: 54).textFieldStyle(.roundedBorder)
                     .onAppear { limit = job.n("timeout_s").map { limitText($0) } ?? "" }
-                    .onSubmit { if let v = parseLimit(limit) { store.control(job.id, "timeout", ["seconds": v]) } }
+                    .onSubmit {
+                        if let v = parseLimit(limit) { store.control(job.id, "timeout", ["seconds": v]) }
+                        else { store.flash("Time limit: seconds (90), 30m, 2h, or empty for none", error: true) }
+                    }
                     .help("Hard time limit: 90 (seconds), 30m, 2h, or empty for none; press Return to apply")
             }
             if final {
@@ -641,7 +821,8 @@ struct JobRow: View {
                 }
             }
             Spacer()
-            if s == "running" { Button("Stop", role: .destructive) { store.control(job.id, "cancel") } }
+            if job.d["run_next"] != nil || job.d["run_last"] != nil { Button("Unpin") { store.control(job.id, "unpin") } }
+            if s == "running" { Button("Stop…", role: .destructive) { store.stop(job) } }
             else { Button(job.pending ? "Cancel" : "Remove", role: .destructive) { store.control(job.id, "remove") } }
         }
         .font(.system(size: 11))
@@ -660,7 +841,7 @@ final class FirstMouseHostingView<V: View>: NSHostingView<V> {
 final class Panel: NSPanel, NSWindowDelegate {
     var pinned = false
     var onClose: (() -> Void)?
-    var onResized: ((NSSize) -> Void)?
+    var onResized: ((NSSize, Bool) -> Void)?  // (new size, whether the height was changed by hand)
     weak var store: Store?
     private(set) var closedAt = Date.distantPast
     private var pressed: (id: String, y: CGFloat)?
@@ -738,13 +919,18 @@ final class Panel: NSPanel, NSWindowDelegate {
 
     override func close() {
         super.close()
+        store?.confirm = nil
         closedAt = Date()
         onClose?()
     }
 
     override func cancelOperation(_ sender: Any?) { close() }  // Esc closes, pinned or not
 
-    func windowDidEndLiveResize(_ notification: Notification) { onResized?(frame.size) }
+    private var resizeStart: NSSize?
+    func windowWillStartLiveResize(_ notification: Notification) { resizeStart = frame.size }
+    func windowDidEndLiveResize(_ notification: Notification) {
+        onResized?(frame.size, abs(frame.height - (resizeStart?.height ?? frame.height)) > 1)
+    }
 }
 
 // MARK: - Menu bar icon
@@ -834,9 +1020,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         host.sizingOptions = []
         panel = Panel(content: host)
         panel.onClose = { [weak self] in self?.item.button?.isHighlighted = false }
-        panel.onResized = { [weak self] size in
+        panel.onResized = { [weak self] size, heightChanged in
             UserDefaults.standard.set(Double(size.width), forKey: "panelWidth")
-            UserDefaults.standard.set(Double(size.height), forKey: "panelHeight")
+            // widening a short panel must not cap its height at that moment's content height
+            if heightChanged { UserDefaults.standard.set(Double(size.height), forKey: "panelHeight") }
             self?.fit()
         }
         store.onPin = { [weak self] in self?.panel.pinned = $0 }
@@ -1048,7 +1235,7 @@ final class SelfTest {
             check("pinned panel survives clicking elsewhere", p.isVisible)
             other.orderOut(nil); NSApp.deactivate(); await wait(0.3)
             // the rows' real on-screen frames, as laid out by SwiftUI
-            let rowA = st.rowFrames[a]?.minY ?? 0 + 8, rowB = st.rowFrames[b]?.midY ?? 0
+            let rowA = (st.rowFrames[a]?.minY ?? 0) + 8, rowB = st.rowFrames[b]?.midY ?? 0
             check("queue shows a above b", rowA < rowB && rowA > 0)
             await drag(NSPoint(x: 120, y: rowB), NSPoint(x: 120, y: rowA + 3))
             check("mouse drag reorders rows", await until {
@@ -1093,9 +1280,9 @@ final class SelfTest {
             check("remove a finished job", await until { !(st.recent + st.older).contains { $0.id == blocker } })
             st.act("/api/clear", ["project": "anvil-selftest"])
             check("clear finished", await until { !st.recent.contains { $0.project == "anvil-selftest" } })
-            p.onResized?(NSSize(width: 333, height: 300)); app.toggle()
+            p.onResized?(NSSize(width: 333, height: 300), true); app.toggle()
             check("resize is remembered", abs(p.frame.width - 333) < 1 && p.frame.height <= 300.5)
-            p.onResized?(NSSize(width: 300, height: 460)); p.close()
+            p.onResized?(NSSize(width: 300, height: 460), true); p.close()
             await cleanup()
             st.act("/api/clear", ["project": "anvil-selftest"])
             st.refresh(); await wait(1)
