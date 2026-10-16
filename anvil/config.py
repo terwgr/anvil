@@ -9,6 +9,13 @@ DEFAULTS = {
     "default_timeout_seconds": None,      # per-job hard limit when the submitter gives none; None = no limit
     "max_timeout_seconds": None,          # optional service maximum; oversized requests are rejected
     "overdue_after_seconds": 600,
+    # "time": projects get equal GPU time, then agents within a project. "turns": strict round robin
+    # (project, then agent), one job per turn. Agents named parent:lane count as their parent either way.
+    "fairness": "time",
+    # A held job (drift, or held by hand) is canceled after this long; None keeps it until released.
+    "held_expire_seconds": 86400,
+    # On a timeout, sample the job's process stacks for this many seconds before stopping it (0 = off).
+    "timeout_sample_seconds": 2,
     "term_grace_seconds": 5,
     # Actors allowed to control other agents' jobs, pause/resume, and use run-next.
     # Agents always control their own jobs. "*" allows everyone.
@@ -20,6 +27,7 @@ DEFAULTS = {
     "probe_interval_seconds": 15,
     # Global hooks: [{"command": "...", "agents": ["*"]}]; receipt JSON is passed on stdin.
     "hooks": [],
+    "hook_timeout_seconds": 60,  # a hook still running then is killed (its whole process group) and retried
 }
 
 

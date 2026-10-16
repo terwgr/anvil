@@ -38,10 +38,16 @@ anvil submit -n train -e 120 -t 900 -- python3 train.py
 - Menu bar: a small anvil — outline when idle, filled while running, with pause bars when new starts are
   paused and "!" when something needs attention. Click it for the panel: one line per job — running job,
   queue, recent results.
-  - Drag queued rows to reorder an agent's own jobs; drag a job to the top to run it next (recorded, visible).
-    Projects and agents otherwise share the GPU fairly, so other cross-agent moves are explained, not applied.
+  - Drag queued rows anywhere: within one agent's jobs it reorders them and fair sharing continues; elsewhere
+    the jobs above the drop point are pinned in that order (recorded, visible as "next"), so the job lands
+    where you drop it. The running job's bar fills against the agent's estimate and turns orange past it.
+  - Hover a row to see its id and agent; the tooltip has status, reason, limits, note. Right-click ▸ Unpin
+    undoes a "next" or "last" placement.
+  - "Needs Attention" lists its causes (failures not yet dismissed, drift holds, a stuck cleanup) under the
+    header, with Dismiss for failures. Stopping a running job and the Clear actions ask first.
   - Hover a row for × (remove: cancels a queued job; stop for the running one); right-click for every action;
-    click to expand the note, log tail, time limit and buttons. ⋯ ▸ Clear Finished empties the recent list.
+    click to expand the note, log tail, time limit and buttons. ⋯ ▸ Clear Finished empties the recent list;
+    ⋯ ▸ Clear Queue… cancels every queued and held job (in the current filter), after a confirmation.
   - Drag the panel's edges to resize; it remembers the size and otherwise fits its content.
   - The pin keeps it open while you work elsewhere; otherwise Esc, clicking elsewhere or the icon closes it.
   `anvil app` opens it.
@@ -58,8 +64,11 @@ The service listens only on a private Unix socket, `~/.anvil/anvil.sock` (owner-
 network port. `~/.anvil/config.json` (all optional): `default_timeout_seconds` (hard limit for jobs
 submitted without one; default none, so jobs run until they finish), `max_timeout_seconds` (if set, every
 job needs a limit up to it), `operators` (actors allowed to pause, run-next and control others' jobs;
-default `["human","panel"]`, `"*"` for everyone), `log_retention` (`max_total_mb`, `max_age_days`),
-`outside_gpu_patterns`, `hooks`.
+default `["human","panel"]`, `"*"` for everyone), `fairness` (`"time"`, default: equal GPU time; or
+`"turns"`: strict round robin), `held_expire_seconds` (cancel jobs held longer; default 86400, `null` keeps
+them), `timeout_sample_seconds` (stack sample before a time-limit kill; default 2, 0 off),
+`log_retention` (`max_total_mb`, `max_age_days`), `outside_gpu_patterns` (add your own GPU binaries), `hooks`,
+`hook_timeout_seconds` (default 60).
 Data, logs and results live in `~/.anvil` (`ANVIL_HOME` overrides).
 
 ## Layout
@@ -79,7 +88,8 @@ python3 -m unittest tests.test_sched
 
 The first checks the fairness policy. The second drives the real panel against the running service with real
 mouse events through the event queue (pin button clicks, row drags) and every control (hold, release, reorder,
-run next, limit, pause, stop, rerun, remove, clear, resize), using throwaway jobs in project `anvil-selftest`.
+run next, limit, pause, stop, rerun, remove, clear, resize), using throwaway jobs in project `anvil-selftest`. It pauses scheduling and runs real jobs, so run it
+while no one else needs the GPU.
 `--snapshot <png> [--dark] [--expand]` renders the panel and `--icons <png>` the four icon states.
 
 ## License

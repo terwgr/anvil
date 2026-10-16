@@ -1,9 +1,13 @@
 """HTTP API over a private Unix socket ($ANVIL_HOME/anvil.sock, mode 0600). No TCP listener."""
+import contextlib
 import json
 import re
 import sys
 import os
 import fcntl
+import select
+import socket
+import traceback
 import socketserver
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
@@ -11,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 from . import config
 from .service import Err, Service
 
-OPS = ("cancel", "hold", "release", "reorder", "run_next", "timeout", "ack", "rm_logs", "rerun", "remove")
+OPS = ("cancel", "hold", "release", "reorder", "move", "unpin", "run_next", "timeout", "ack", "rm_logs", "rerun", "remove")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -20,6 +24,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):
         pass
+
+    def gone(self):
+        """The client hung up (a killed `anvil wait`, a canceled MCP call): readable with nothing to read."""
+        try:
+            r, _, _ = select.select([self.connection], [], [], 0)
+            return bool(r) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
 
     def send(self, obj, code=200, ctype="application/json"):
         body = obj if isinstance(obj, bytes) else json.dumps(obj, separators=(",", ":")).encode()
@@ -39,13 +51,15 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST":
                 n = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(n) or b"{}") if n else {}
-                actor = body.pop("actor", None) or "human"
+                if not isinstance(body, dict):
+                    raise Err("invalid", "request body must be a JSON object")
+                actor = body.pop("actor", None) or "unknown"  # never an operator by omission
                 if path == "/api/submit":
                     return self.send(s.submit(body, actor))
                 if path in ("/api/pause", "/api/resume"):
                     return self.send(s.set_paused(path.endswith("pause"), actor))
                 if path == "/api/clear":
-                    return self.send(s.clear_finished(actor, body.get("project"), body.get("agent")))
+                    return self.send(s.clear_finished(actor, body.get("project"), body.get("agent"), bool(body.get("queue"))))
                 if path == "/api/hooks":
                     return self.send(s.add_hook(body.get("agent") or actor, body["command"]))
                 if path == "/api/hooks/delete":
@@ -62,8 +76,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(s.list(qs.get("project"), qs.get("agent"), qs.get("status"), qs.get("limit", 50),
                                         qs.get("after")))
             if path == "/api/wait":
-                return self.send(s.wait(qs.get("job"), qs.get("revision"), qs.get("cursor"), qs.get("agent"),
-                                        qs.get("project"), qs.get("timeout", 30), qs.get("until_done") == "1"))
+                r = s.wait(qs.get("job"), qs.get("revision"), qs.get("cursor"), qs.get("agent"),
+                           qs.get("project"), qs.get("timeout", 30), qs.get("until_done") == "1", gone=self.gone)
+                if r is None:  # nobody to answer; nothing was marked delivered
+                    self.close_connection = True
+                    return
+                return self.send(r)
             if path == "/api/events":
                 with s.L:
                     ev = s.events(qs.get("cursor", 0), qs.get("job"), qs.get("agent"), qs.get("project"),
@@ -80,8 +98,16 @@ class Handler(BaseHTTPRequestHandler):
             raise Err("not_found", "unknown endpoint", 404)
         except Err as e:
             self.send({"error": e.code, "message": e.message}, e.http)
-        except (KeyError, ValueError, TypeError) as e:
+        except KeyError as e:
+            self.send({"error": "invalid", "message": f"missing {e}"}, 400)
+        except (ValueError, TypeError) as e:
             self.send({"error": "invalid", "message": str(e)[:200]}, 400)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as e:  # an answer, not a dropped connection that reads as "service unreachable"
+            traceback.print_exc(file=sys.stderr)
+            with contextlib.suppress(OSError):
+                self.send({"error": "internal", "message": f"{type(e).__name__}: {e}"[:300]}, 500)
 
     def do_GET(self):
         self.handle_one("GET")

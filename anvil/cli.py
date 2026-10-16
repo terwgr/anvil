@@ -39,8 +39,10 @@ class UnixConn(http.client.HTTPConnection):
         self.sock.connect(str(config.sock()))
 
 
-def api(method, path, body=None, timeout=10, autostart=True):
+def api(method, path, body=None, timeout=10, autostart=True, on_conn=None):
     c = UnixConn(timeout)
+    if on_conn:
+        on_conn(c)  # lets the MCP server abort a request its client canceled
     try:
         c.request(method, path, json.dumps(body) if body is not None else None,
                   {"Content-Type": "application/json"})
@@ -49,12 +51,14 @@ def api(method, path, body=None, timeout=10, autostart=True):
     except (FileNotFoundError, ConnectionRefusedError) as e:
         if autostart:
             start_daemon()
-            return api(method, path, body, timeout, autostart=False)
+            return api(method, path, body, timeout, autostart=False, on_conn=on_conn)
         raise ApiError({"error": "unavailable", "message": f"anvil service not running: {e}"})
     except PermissionError as e:
         raise ApiError(SANDBOXED | {"message": f"{SANDBOXED['message']} ({e})"})
-    except OSError as e:
-        raise ApiError({"error": "unavailable", "message": f"anvil service unreachable: {e}"})
+    except (OSError, http.client.HTTPException) as e:
+        raise ApiError({"error": "unavailable", "message": f"anvil service unreachable: {e!r}"})
+    except ValueError as e:
+        raise ApiError({"error": "bad_response", "message": f"the service sent something that isn't JSON: {e}"})
     finally:
         c.close()
     if r.status >= 400:
@@ -88,8 +92,17 @@ def out(obj):
     print(json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
 
 
+def me():
+    """Who an agent is when it doesn't say: $ANVIL_AGENT, else the user name. Submit, wait and controls all use
+    this, so an agent that forgot to set ANVIL_AGENT can still wait on and control what it submitted."""
+    return os.environ.get("ANVIL_AGENT") or os.environ.get("USER") or "agent"
+
+
 def actor(a):
-    return a.actor or os.environ.get("ANVIL_AGENT") or "human"
+    # A person at a terminal acts as "human" (an operator); a program (an agent's shell) acts as itself.
+    if a.actor or os.environ.get("ANVIL_AGENT"):
+        return a.actor or os.environ["ANVIL_AGENT"]
+    return "human" if sys.stdin.isatty() and sys.stdout.isatty() else me()
 
 
 def default_project(cwd):
@@ -100,9 +113,18 @@ def default_project(cwd):
 def parse_deadline(v):
     if v is None:
         return None
-    if v.startswith("+"):
-        return time.time() + float(v[1:])
-    return datetime.fromisoformat(v).timestamp()
+    try:
+        if v.startswith("+") or v.replace(".", "", 1).isdigit():  # +3600 or 3600: seconds from now
+            return time.time() + float(v.lstrip("+"))
+        return datetime.fromisoformat(v).timestamp()
+    except ValueError:
+        raise ApiError({"error": "invalid", "message": f"--start-before takes +SECONDS or an ISO time, not {v!r}"})
+
+
+def default_name(cmd):
+    """The script, not the last argument: `python3 train.py --lr 3e-4` is "train.py", not "3e-4"."""
+    rest = [x for x in cmd[1:] if not x.startswith("-")]
+    return Path(rest[0] if rest else cmd[0]).name
 
 
 # ---------------- human views ----------------
@@ -194,11 +216,13 @@ def cmd_submit(a):
         retry = {"max_attempts": a.max_attempts, "backoff_seconds": a.backoff,
                  "exit_codes": [int(c) for c in (a.retry_codes or "").split(",") if c],
                  "reasons": [r for r in (a.retry_on or "").split(",") if r]}
-    body = {"project": a.project or default_project(cwd), "agent": a.agent or os.environ.get("ANVIL_AGENT")
-            or os.environ.get("USER", "human"), "name": a.name or Path(cmd[-1]).name, "note": a.note,
+    if not os.path.isdir(cwd):
+        raise ApiError({"error": "invalid", "message": f"cwd does not exist: {cwd}"})
+    body = {"project": a.project or default_project(cwd), "agent": a.agent or me(),
+            "name": a.name or default_name(cmd), "note": a.note,
             "estimated_seconds": a.estimate, "timeout_seconds": a.timeout, "start_before": parse_deadline(a.start_before),
             "cmd": cmd, "cwd": cwd, "env": env, "submission_key": a.key, "retry": retry,
-            "check_drift": not a.no_drift_check}
+            "check_drift": not a.no_drift_check, "watch": a.watch}
     body["actor"] = a.actor or body["agent"]
     out(api("POST", "/api/submit", body))
 
@@ -219,7 +243,7 @@ def cmd_wait(a):
     timeout = a.timeout if a.timeout is not None else None if a.until_done else 60
     deadline = None if timeout is None else time.monotonic() + timeout
     cursor = a.cursor
-    agent = a.agent or (os.environ.get("ANVIL_AGENT") if a.until_done and not a.id else None)
+    agent = a.agent or (me() if a.until_done and not a.id else None)
     while True:
         left = 300 if deadline is None else max(1, min(deadline - time.monotonic(), 300))
         r = api("GET", "/api/wait" + qs(job=a.id, revision=a.rev, cursor=cursor, agent=agent,
@@ -338,6 +362,8 @@ def main(argv=None):
     s.add_argument("--retry-codes", help="comma list of retryable exit codes")
     s.add_argument("--retry-on", help="comma list: timed_out,signal")
     s.add_argument("--backoff", type=float, default=30)
+    s.add_argument("--watch", action="append", metavar="PATH",
+                   help="path the job depends on (repeatable); drift checks only these")
     s.add_argument("--no-drift-check", action="store_true")
     s.add_argument("cmd", nargs=argparse.REMAINDER)
 
@@ -374,7 +400,8 @@ def main(argv=None):
                            ("release", ("accept_drift",), "release a held job"),
                            ("ack", (), "acknowledge a failure (unprotects its logs)"),
                            ("rm-logs", (), "delete a finished job's logs"),
-                           ("remove", (), "remove a job from views (cancels it if pending)")):
+                           ("remove", (), "remove a job from views (cancels it if pending)"),
+                           ("unpin", (), "undo run-next or move-to-back: back to its fair place")):
         s = sub(name, control(name.replace("-", "_"), **dict.fromkeys(extra)), h)
         s.add_argument("id")
         if "reason" in extra:
@@ -388,6 +415,13 @@ def main(argv=None):
     g.add_argument("--after")
     g.add_argument("--first", action="store_true", default=None)
     g.add_argument("--last", action="store_true", default=None)
+    s = sub("move", control("move", before=1, after=1, last=1),
+            "operator: place a queued job anywhere in the queue (jobs above it are pinned in that order)")
+    s.add_argument("id")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--before")
+    g.add_argument("--after")
+    g.add_argument("--last", action="store_true", default=None)
     s = sub("run-next", control("run_next", reason=1), "operator override: start this job next")
     s.add_argument("id")
     s.add_argument("--reason", required=True)
@@ -399,7 +433,9 @@ def main(argv=None):
     s.add_argument("id")
     s.add_argument("--timeout", dest="timeout_seconds", type=time_limit)
     s = sub("clear", lambda a: out(api("POST", "/api/clear", {"actor": actor(a), "project": a.project,
-                                                              "agent": a.agent})), "remove all finished jobs from views")
+                                                              "agent": a.agent, "queue": a.queue})),
+            "remove all finished jobs from views (--queue: cancel every queued and held job)")
+    s.add_argument("--queue", action="store_true")
     s.add_argument("--project")
     s.add_argument("--agent")
     sub("pause", lambda a: out(api("POST", "/api/pause", {"actor": actor(a)})), "stop new starts")
@@ -437,4 +473,9 @@ def main(argv=None):
         sys.exit(1)
     except PermissionError as e:  # e.g. creating $ANVIL_HOME or the service log from inside a sandbox
         out(SANDBOXED | {"message": f"{SANDBOXED['message']} ({e})"})
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:  # always the JSON contract, never a traceback
+        out({"error": "internal", "message": f"{type(e).__name__}: {e}"[:300]})
         sys.exit(1)
