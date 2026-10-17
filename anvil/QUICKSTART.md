@@ -1,8 +1,8 @@
 # Anvil — GPU queue for agents
 
 This computer has one GPU, shared through Anvil by every project and agent. When told to "use Anvil",
-run every GPU or heavy compute job (training, inference, benchmarks, evals) through `anvil submit`, never
-directly. One job runs at a time, fairly shared.
+run every GPU or heavy compute job (training, inference, benchmarks, evals) through `anvil run` (or
+`anvil submit`), never directly. One job runs at a time, fairly shared.
 
 Don't poll. Every check that finds nothing new costs you a turn and fills your context. Hand Anvil the job and
 get one answer back when it's done: the outcome, the end of the log and the result files, so there is
@@ -57,9 +57,9 @@ If your tools run commands in a sandbox, run `anvil` with permission to leave it
     anvil wait j12 --rev 3                       # returns when the record changes
     anvil wait --until-done                      # your next finished jobs ($ANVIL_AGENT, or --agent)
     anvil events --cursor 41 --agent me          # missed events after reconnecting
-If your harness runs background commands and re-invokes you when they exit, run `anvil wait` that way.
-Or register a wake hook: `anvil hook --agent me --command '<cmd>'`
-(receipt JSON on stdin, retried, deduplicated by event id).
+If your harness runs background commands and re-invokes you when they exit, run `anvil run` or `anvil wait`
+that way. Or register a wake hook: `anvil hook --agent me --command '<cmd>'` (a short receipt on stdin: status,
+exit code and reason, without the log tail or result files; retried, deduplicated by event id).
 
 ### States
 queued (waiting; `why` and `position` say where) · held (won't start; `why` gives the reason, e.g.

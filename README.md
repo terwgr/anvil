@@ -61,7 +61,7 @@ queues the job, waits until it is done and prints its receipt (outcome, log tail
   instead of checking in while it runs; a result whose answer was lost (a killed client) comes back on the
   next wait.
 
-Route each project's GPU entrypoint through `anvil submit`; work started outside Anvil is detected
+Route each project's GPU entrypoint through `anvil run` or `anvil submit`; work started outside Anvil is detected
 best-effort and shown, never killed.
 
 ## Configuration
