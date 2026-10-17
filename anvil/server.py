@@ -60,6 +60,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(s.set_paused(path.endswith("pause"), actor))
                 if path == "/api/clear":
                     return self.send(s.clear_finished(actor, body.get("project"), body.get("agent"), bool(body.get("queue"))))
+                if path == "/api/ack":
+                    return self.send(s.ack(body["delivery"]))
                 if path == "/api/hooks":
                     return self.send(s.add_hook(body.get("agent") or actor, body["command"]))
                 if path == "/api/hooks/delete":
@@ -77,7 +79,8 @@ class Handler(BaseHTTPRequestHandler):
                                         qs.get("after")))
             if path == "/api/wait":
                 r = s.wait(qs.get("job"), qs.get("revision"), qs.get("cursor"), qs.get("agent"),
-                           qs.get("project"), qs.get("timeout", 30), qs.get("until_done") == "1", gone=self.gone)
+                           qs.get("project"), qs.get("timeout", 30), qs.get("until_done") == "1", gone=self.gone,
+                           confirm=qs.get("confirm") == "1")
                 if r is None:  # nobody to answer; nothing was marked delivered
                     self.close_connection = True
                     return

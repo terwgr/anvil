@@ -33,8 +33,10 @@ codex mcp add anvil -- anvil-mcp
 ## Use
 
 ```bash
-anvil submit -n train -e 120 -t 900 -- python3 train.py
+anvil run -n train -e 120 -t 900 -- python3 train.py
 ```
+queues the job, waits until it is done and prints its receipt (outcome, log tail, result files);
+`anvil submit` takes the same flags and returns at once.
 - Menu bar: a small anvil — outline when idle, filled while running, with pause bars when new starts are
   paused and "!" when something needs attention. Click it for the panel: one line per job — running job,
   queue, recent results.
@@ -53,7 +55,11 @@ anvil submit -n train -e 120 -t 900 -- python3 train.py
   `anvil app` opens it.
 - `anvil top` — live terminal view; `anvil view` — one-shot.
 - Agents: tell any agent "use Anvil for the GPU". Running `anvil` (or `anvil help`) prints its guide ([anvil/QUICKSTART.md](anvil/QUICKSTART.md)).
-- MCP: agents get `gpu_submit`, `gpu_wait`, `gpu_logs` and the rest; they pass `agent` to name themselves.
+- MCP: agents get `gpu_run` (submit and wait in one call), `gpu_submit`, `gpu_wait`, `gpu_logs` and the rest;
+  they pass `agent` to name themselves.
+- Agents get one answer per finished job, with what they need to act on it (outcome, log tail, result files),
+  instead of checking in while it runs; a result whose answer was lost (a killed client) comes back on the
+  next wait.
 
 Route each project's GPU entrypoint through `anvil submit`; work started outside Anvil is detected
 best-effort and shown, never killed.
@@ -80,13 +86,14 @@ Data, logs and results live in `~/.anvil` (`ANVIL_HOME` overrides).
 ## Checks
 
 ```bash
-python3 -m unittest tests.test_sched
+python3 -m unittest tests.test_sched tests.test_wait
 ```
 ```bash
 ~/Applications/Anvil.app/Contents/MacOS/Anvil --selftest
 ```
 
-The first checks the fairness policy. The second drives the real panel against the running service with real
+The first checks the fairness policy, and waits, receipts and delivery against a throwaway service (its own
+`ANVIL_HOME`; tiny shell jobs, no GPU). The second drives the real panel against the running service with real
 mouse events through the event queue (pin button clicks, row drags) and every control (hold, release, reorder,
 run next, limit, pause, stop, rerun, remove, clear, resize), using throwaway jobs in project `anvil-selftest`. It pauses scheduling and runs real jobs, so run it
 while no one else needs the GPU.

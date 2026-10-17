@@ -1,5 +1,6 @@
 """anvil — CLI for the local GPU queue. Prints compact JSON (the agent contract) unless noted."""
 import argparse
+import contextlib
 import http.client
 import json
 import os
@@ -196,7 +197,7 @@ def cmd_top(a):
 
 
 # ---------------- commands ----------------
-def cmd_submit(a):
+def submit_body(a):
     cwd = os.path.abspath(a.cwd or os.getcwd())
     cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
     if not cmd:
@@ -224,7 +225,11 @@ def cmd_submit(a):
             "cmd": cmd, "cwd": cwd, "env": env, "submission_key": a.key, "retry": retry,
             "check_drift": not a.no_drift_check, "watch": a.watch}
     body["actor"] = a.actor or body["agent"]
-    out(api("POST", "/api/submit", body))
+    return body
+
+
+def cmd_submit(a):
+    out(api("POST", "/api/submit", submit_body(a)))
 
 
 def time_limit(v):  # named for argparse's "invalid time_limit value" message
@@ -238,19 +243,41 @@ def control(op, **extra):
     return f
 
 
+def wait(job=None, rev=None, cursor=None, agent=None, until_done=False, timeout=None):
+    """Repeat bounded waits until something comes back or the deadline (none: wait as long as it takes)."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        left = 300 if deadline is None else max(1, min(deadline - time.monotonic(), 300))
+        r = api("GET", "/api/wait" + qs(job=job, revision=rev, cursor=cursor, agent=agent, timeout=left,
+                                        until_done=until_done, confirm=True), timeout=left + 10)
+        if not r.get("unchanged") or (deadline is not None and time.monotonic() >= deadline):
+            return r
+        cursor = r.get("cursor", cursor)  # don't miss events between rounds
+
+
+def handed_over(r):
+    """Print a wait's answer, then acknowledge it: a result counts as delivered only once it is out. If this
+    process dies first, the next wait gets the result again instead of losing it."""
+    tok = r.pop("delivery", None)
+    out(r)
+    sys.stdout.flush()
+    if tok:
+        with contextlib.suppress(ApiError):
+            api("POST", "/api/ack", {"delivery": tok}, autostart=False)
+
+
 def cmd_wait(a):
     # With --until-done and no --timeout there is no deadline: the call returns when the work is done.
     timeout = a.timeout if a.timeout is not None else None if a.until_done else 60
-    deadline = None if timeout is None else time.monotonic() + timeout
-    cursor = a.cursor
     agent = a.agent or (me() if a.until_done and not a.id else None)
-    while True:
-        left = 300 if deadline is None else max(1, min(deadline - time.monotonic(), 300))
-        r = api("GET", "/api/wait" + qs(job=a.id, revision=a.rev, cursor=cursor, agent=agent,
-                                        timeout=left, until_done=a.until_done), timeout=left + 10)
-        if not r.get("unchanged") or (deadline is not None and time.monotonic() >= deadline):
-            return out(r)
-        cursor = r.get("cursor", cursor)  # don't miss events between rounds
+    handed_over(wait(a.id, a.rev, a.cursor, agent, a.until_done, timeout))
+
+
+def cmd_run(a):
+    """Submit, then wait until the job is done: one command, one answer (the receipt). Run it in the background
+    where the harness resumes you when a command exits, and nothing happens in between."""
+    j = api("POST", "/api/submit", submit_body(a))
+    handed_over(wait(j["id"], until_done=True, timeout=a.wait_timeout))
 
 
 def cmd_logs(a):
@@ -345,27 +372,32 @@ def main(argv=None):
         s.add_argument("--actor", default=argparse.SUPPRESS)
         return s
 
-    s = sub("submit", cmd_submit, "queue a GPU job: anvil submit -n NAME [opts] -- CMD...")
-    s.add_argument("-n", "--name")
-    s.add_argument("-p", "--project", help="default: git repo / directory name")
-    s.add_argument("-a", "--agent", help="stable agent id (default $ANVIL_AGENT)")
-    s.add_argument("--note")
-    s.add_argument("-e", "--estimate", type=float, help="estimated run seconds (advisory)")
-    s.add_argument("-t", "--timeout", type=time_limit, help="hard time limit, seconds from launch "
-                   "(default: none, or the config default; 0 or none = no limit)")
-    s.add_argument("--start-before", help="cancel if not started by: +SECONDS or ISO time")
-    s.add_argument("--key", help="submission key; a repeat returns the original job")
-    s.add_argument("--cwd")
-    s.add_argument("--env", action="append", metavar="K=V")
-    s.add_argument("--pass-env", action="append", metavar="K")
-    s.add_argument("--max-attempts", type=int)
-    s.add_argument("--retry-codes", help="comma list of retryable exit codes")
-    s.add_argument("--retry-on", help="comma list: timed_out,signal")
-    s.add_argument("--backoff", type=float, default=30)
-    s.add_argument("--watch", action="append", metavar="PATH",
-                   help="path the job depends on (repeatable); drift checks only these")
-    s.add_argument("--no-drift-check", action="store_true")
-    s.add_argument("cmd", nargs=argparse.REMAINDER)
+    def submit_args(s):
+        s.add_argument("-n", "--name")
+        s.add_argument("-p", "--project", help="default: git repo / directory name")
+        s.add_argument("-a", "--agent", help="stable agent id (default $ANVIL_AGENT)")
+        s.add_argument("--note")
+        s.add_argument("-e", "--estimate", type=float, help="estimated run seconds (advisory)")
+        s.add_argument("-t", "--timeout", type=time_limit, help="hard time limit, seconds from launch "
+                       "(default: none, or the config default; 0 or none = no limit)")
+        s.add_argument("--start-before", help="cancel if not started by: +SECONDS or ISO time")
+        s.add_argument("--key", help="submission key; a repeat returns the original job")
+        s.add_argument("--cwd")
+        s.add_argument("--env", action="append", metavar="K=V")
+        s.add_argument("--pass-env", action="append", metavar="K")
+        s.add_argument("--max-attempts", type=int)
+        s.add_argument("--retry-codes", help="comma list of retryable exit codes")
+        s.add_argument("--retry-on", help="comma list: timed_out,signal")
+        s.add_argument("--backoff", type=float, default=30)
+        s.add_argument("--watch", action="append", metavar="PATH",
+                       help="path the job depends on (repeatable); drift checks only these")
+        s.add_argument("--no-drift-check", action="store_true")
+        s.add_argument("cmd", nargs=argparse.REMAINDER)
+
+    submit_args(sub("submit", cmd_submit, "queue a GPU job: anvil submit -n NAME [opts] -- CMD..."))
+    s = sub("run", cmd_run, "submit, then wait until done; prints the receipt (log tail, result files)")
+    s.add_argument("--wait-timeout", type=float, help="stop waiting after this many seconds (default: until done)")
+    submit_args(s)
 
     s = sub("status", lambda a: out(api("GET", f"/api/jobs/{a.id}" if a.id else "/api/overview")),
             "one job, compact; without an id, the whole queue")

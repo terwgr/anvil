@@ -4,21 +4,24 @@ This computer has one GPU, shared through Anvil by every project and agent. When
 run every GPU or heavy compute job (training, inference, benchmarks, evals) through `anvil submit`, never
 directly. One job runs at a time, fairly shared.
 
-Don't poll. Submit, then make one wait that lasts until the job is done: no loops of short waits, no
-repeated status or log checks while it runs. Each check that finds nothing new costs you a turn.
+Don't poll. Every check that finds nothing new costs you a turn and fills your context. Hand Anvil the job and
+get one answer back when it's done: the outcome, the end of the log and the result files, so there is
+usually nothing left to look up.
 
 ## Do this
 Pick a stable name (e.g. project-task) and put it on every command: most agent tools start a fresh shell per
 command, so an `export` from an earlier command is gone.
 
-    ANVIL_AGENT=me anvil submit -n train -e 120 -t 900 --watch train.py --watch src -- python3 train.py --lr 3e-4
-    -> {"id":"j12","status":"queued","position":2,"why":"GPU busy (j11)",...}
-    ANVIL_AGENT=me anvil wait j12 --until-done   # returns when it finishes (or needs you: action_required)
-    ANVIL_AGENT=me anvil logs j12 --tail 4000    # then check output and your result files
-Run the wait in the background if your tools can (and keep working); if a command must finish within your
-tool's time limit (often 2 minutes), add `--timeout 100` and repeat while it says `"unchanged":true`.
-Several jobs: `anvil wait --until-done` (no id) returns your finished jobs that no wait has returned yet;
-repeat it until it says `"none_pending":true`. Nothing is missed between calls, even if a wait is killed.
+    ANVIL_AGENT=me anvil run -n train -e 120 -t 900 --watch train.py --watch src -- python3 train.py --lr 3e-4
+    -> {"id":"j12","status":"succeeded","exit_code":0,"log_tail":"...val_loss 0.41","results":["metrics.json"],...}
+`anvil run` queues the job and waits until it is done (or needs you: `action_required`), then prints the
+receipt. Run it in the background if your tools resume you when a command exits, and keep working: you
+are woken once, with the answer. If a command must finish within your tool's time limit (often 2 minutes),
+use `anvil submit` (same flags; prints the id at once) and `anvil wait j12 --until-done --timeout 100`,
+repeated while it says `"unchanged":true`.
+Several jobs: `anvil submit` each, then one `anvil wait --until-done` (no id): it returns every finished job
+no wait has returned yet; repeat until `"none_pending":true`. Don't wait per job. Nothing is lost between
+calls: if a wait is killed before it prints, the next one returns the same results.
 
 `-e` your runtime guess (seconds, advisory; a rough guess is fine) · `-t` optional hard time limit from
 launch (default none) · `-n` short name · `--note` why. All output is compact JSON; errors are
@@ -49,7 +52,8 @@ If your tools run commands in a sandbox, run `anvil` with permission to leave it
   the parent may control their jobs.
 
 ### Waiting (don't poll)
-    anvil wait j12 --until-done --timeout 100   # bounded: final status, or {"unchanged":true,"approx_left_s":..}
+    anvil run [submit flags] -- CMD             # submit and wait: one receipt (--wait-timeout to bound it)
+    anvil wait j12 --until-done --timeout 100   # bounded: receipt, or {"unchanged":true,"approx_left_s":..}
     anvil wait j12 --rev 3                       # returns when the record changes
     anvil wait --until-done                      # your next finished jobs ($ANVIL_AGENT, or --agent)
     anvil events --cursor 41 --agent me          # missed events after reconnecting
@@ -66,6 +70,8 @@ stopping/cleanup) · succeeded (exit 0 only — check your own results) · faile
 interrupted (service restarted, outcome unknown; never auto-relaunched).
 
 ### Output
+A finished job comes back as a receipt: status and exit code, `log_tail` (the last lines; more of them on
+failure) and `results` (files in `results_dir`). Look further only when that isn't enough:
     anvil logs j12 --tail 4000      # bounded; --since <cursor> to continue; --raw for text
     anvil show j12                  # command, attempts, control history, results files
 Write result files to `$ANVIL_RESULT_DIR`. Optional progress: write
@@ -82,8 +88,11 @@ Fairness: projects get equal GPU time, then agents within a project (or strict t
 `"fairness": "turns"`). Many submissions earn no extra share. Only the job's agent (or an operator)
 controls it: use the same `--actor`/`agent` you submitted with.
 
-MCP: the `anvil-mcp` server offers the same commands as tools: gpu_submit, gpu_wait, gpu_logs, gpu_status,
-gpu_detail, gpu_list, gpu_control, gpu_overview. gpu_wait waits up to 240s per call (under MCP clients' 300s
-tool limit; set ANVIL_MCP_WAIT to change it); call it again while it returns unchanged. Without `agent`, a
-session is one agent (`agent-<pid>`); if you pass `agent`, pass the same one to every tool. Jobs run with the
-MCP server's PATH and venv unless you pass `env`.
+MCP: the `anvil-mcp` server offers the same commands as tools: gpu_run, gpu_submit, gpu_wait, gpu_logs,
+gpu_status, gpu_detail, gpu_list, gpu_control, gpu_overview. gpu_run is `anvil run` within one tool call
+(jobs:[...] for a batch, one entry per job); gpu_run and gpu_wait wait up to 240s per call (under MCP
+clients' 300s tool limit; set ANVIL_MCP_WAIT to change it). For longer jobs, gpu_submit and then run
+`anvil wait --until-done` in the background with the session's agent name, if your tools can; otherwise call
+gpu_wait again while it returns unchanged. Without `agent`, a session is one agent (`agent-<pid>`); if you
+pass `agent`, pass the same one to every tool. Jobs run with the MCP server's PATH and venv unless you pass
+`env`.

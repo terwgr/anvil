@@ -2,9 +2,12 @@
 import contextlib
 import hashlib
 import inspect
+import itertools
 import json
 import math
 import os
+import re
+import secrets
 import shutil
 import signal
 import sqlite3
@@ -24,6 +27,8 @@ NOTE_MAX = 500
 CODE_SUFFIXES = {".py", ".sh", ".swift", ".metal", ".jl", ".js", ".ts", ".lua", ".r", ".R", ".m", ".mm", ".c", ".cc",
                  ".cpp", ".h", ".hpp", ".cu", ".rs", ".go", ".rb", ".pl"}
 FILE_HASH_MAX = 64 << 20  # larger files named in a command are identified by size and mtime
+LEASE_S = 60  # a confirmed wait's results go out again if the client hasn't acknowledged them by then
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs(
@@ -36,7 +41,8 @@ CREATE TABLE IF NOT EXISTS jobs(
  acked INTEGER DEFAULT 0, logs_removed INTEGER DEFAULT 0, term_s REAL, cleanup_s REAL,
  hidden INTEGER DEFAULT 0,  -- hidden: removed from views; the compact receipt stays
  reported INTEGER DEFAULT 0,  -- reported: 1 = a wait has returned this finished job, 2 = this hold
- last_at REAL);  -- moved to the back by hand: runs only when nothing else is eligible
+ last_at REAL,  -- moved to the back by hand: runs only when nothing else is eligible
+ delivery TEXT, sent_at REAL);  -- sent by a confirmed wait as "token:reported", not yet acknowledged
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS jobs_agent ON jobs(agent, status);
 CREATE TABLE IF NOT EXISTS attempts(job_id TEXT, n INTEGER, started REAL, finished REAL, pgid INTEGER,
@@ -71,7 +77,12 @@ def _m3(db):
     db.execute("ALTER TABLE jobs ADD COLUMN last_at REAL")
 
 
-MIGRATIONS = [_m1, _m2, _m3]
+def _m4(db):
+    db.execute("ALTER TABLE jobs ADD COLUMN delivery TEXT")
+    db.execute("ALTER TABLE jobs ADD COLUMN sent_at REAL")
+
+
+MIGRATIONS = [_m1, _m2, _m3, _m4]
 
 
 def open_db(path):
@@ -680,15 +691,75 @@ class Service:
         return [{"id": r["id"], "ts": round(r["ts"], 1), "kind": r["kind"], "job": r["job_id"],
                  **(json.loads(r["data"]) if r["data"] else {})} for r in rows]
 
+    def tail(self, j, lines, chars):
+        """The last lines of a job's latest log as a person would read them: progress-bar rewrites (\\r) and
+        terminal colors collapsed."""
+        if j["logs_removed"] or not j["attempt"]:
+            return ""
+        p = self.home / "logs" / j["id"] / f"{j['attempt']}.log"
+        try:
+            with open(p, "rb") as f:
+                f.seek(max(0, p.stat().st_size - 16384))
+                text = f.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+        rows = [ANSI.sub("", r.rstrip("\r").rsplit("\r", 1)[-1]).rstrip() for r in text.split("\n")]
+        return "\n".join([r for r in rows if r.strip()][-lines:])[-chars:]
+
+    def receipt(self, jid, j=None):
+        """A finished job as its agent needs it, so the outcome rarely takes another call: the compact status,
+        the end of its log (more of it on failure) and its result files."""
+        j = j or self.job(jid)
+        d = self.status(jid, j)
+        if j["status"] not in FINAL:
+            return d
+        d = {k: v for k, v in d.items() if v is not None}  # empty fields only cost the reader
+        ok = j["status"] == "succeeded"
+        t = self.tail(j, 8 if ok else 30, 600 if ok else 2000)
+        if t:
+            d["log_tail"] = t
+        rd = self.home / "results" / jid
+        if rd.exists():
+            files = sorted(str(p.relative_to(rd)) for p in itertools.islice(rd.rglob("*"), 500) if p.is_file())
+            if files:
+                d.update(results_dir=str(rd), results=files[:10])
+                if len(files) > 10:
+                    d["results_more"] = len(files) - 10
+        return d
+
+    def _deliver(self, groups, confirm):
+        """Mark what a wait is returning ({reported value: job ids}). confirm: the client acknowledges receipt
+        (ack) once it has passed the result on; until then the jobs are only leased to this delivery and go out
+        again after LEASE_S, so a result lost on the way (a killed client, a dropped connection) is sent twice
+        rather than never. Without confirm (older clients) they count as delivered at once."""
+        tok = secrets.token_hex(6) if confirm else None
+        for v, ids in groups.items():
+            if ids:
+                self.x(f"UPDATE jobs SET reported=?, delivery=?, sent_at=? WHERE id IN ({','.join('?' * len(ids))})",
+                       *((0, f"{tok}:{v}", time.time()) if confirm else (v, None, None)), *ids)
+        return tok
+
+    def ack(self, delivery):
+        """The client received a confirmed wait's results: they are delivered and no wait returns them again."""
+        with self.L:
+            n = 0
+            with self.tx():
+                for v in (1, 2):
+                    n += self.x("UPDATE jobs SET reported=?, delivery=NULL, sent_at=NULL WHERE delivery=?",
+                                v, f"{delivery}:{v}").rowcount
+            self._wake()
+        return {"acked": n}
+
     def wait(self, job=None, revision=None, cursor=None, agent=None, project=None, timeout=30, until_done=False,
-             gone=None):
+             gone=None, confirm=False):
         """Bounded wait (<=600s per call; the CLI repeats it). With job: returns when that job's record changes
         (until_done: when it finishes or is held). Without job, until_done: returns the agent's finished jobs, and
         jobs newly held, that no wait has returned yet, or none_pending when it has nothing left to wait for. A
         held job never finishes on its own, so it comes back at once with action_required. With cursor: returns
-        new events. Returns {'unchanged': True, ...} on timeout.
+        new events. Returns {'unchanged': True, ...} on timeout. Finished jobs come back as receipts.
         gone: returns True once the caller has disconnected; then nothing is marked delivered, so a result is
-        never consumed by a client that won't see it."""
+        never consumed by a client that won't see it. confirm: the answer carries `delivery`, which the client
+        acknowledges (ack) after passing the result on; see _deliver."""
         timeout = max(0.0, min(number(30 if timeout in (None, "") else timeout, "timeout", 0), 600))
         deadline = time.monotonic() + timeout
         while True:
@@ -702,9 +773,12 @@ class Service:
                     # a hold its agent must resolve comes back once (until the job changes again)
                     act = j["status"] == "held" and self.owner_must_act(j) and (changed or j["reported"] == 0)
                     if (changed and not until_done) or (until_done and (done or act)):
+                        out = self.receipt(job, j)
                         if done or act:
-                            self.x("UPDATE jobs SET reported=? WHERE id=?", 1 if done else 2, job)
-                        return self.status(job, j)
+                            tok = self._deliver({1 if done else 2: [job]}, confirm)
+                            if tok:
+                                out["delivery"] = tok
+                        return out
                     cur = self.cursor()
                 elif until_done:
                     if not (agent or project):  # otherwise one agent's wait would consume everyone's results
@@ -719,17 +793,22 @@ class Service:
                     rows = self.q(f"SELECT * FROM jobs WHERE {' AND '.join(w)} AND "
                                   f"((status IN ({fin}) AND reported!=1) OR (status NOT IN ({fin}) AND hidden=0)) "
                                   "ORDER BY finished", *a, *FINAL, *FINAL)
-                    finished = [r["id"] for r in rows if r["status"] in FINAL]
+                    # Leased to an unacknowledged delivery: not sent again until the lease runs out, and still
+                    # pending meanwhile, so none_pending never ends a wait whose results may have been lost.
+                    stale = time.time() - LEASE_S
+                    free = [r for r in rows if not r["delivery"] or (r["sent_at"] or 0) < stale]
+                    finished = [r["id"] for r in free if r["status"] in FINAL]
                     held = [r for r in rows if r["status"] == "held"]
-                    act = [r["id"] for r in held if r["reported"] == 0 and self.owner_must_act(r)]
+                    act = [r["id"] for r in free if r["status"] == "held" and r["reported"] == 0
+                           and self.owner_must_act(r)]
                     if finished or act:
-                        for ids, v in ((finished, 1), (act, 2)):
-                            if ids:
-                                self.x(f"UPDATE jobs SET reported={v} WHERE id IN ({','.join('?' * len(ids))})", *ids)
-                        out = {"jobs": [self.status(i) for i in finished + act],
+                        tok = self._deliver({1: finished, 2: act}, confirm)
+                        out = {"jobs": [self.receipt(i) for i in finished + act],
                                "pending": len(rows) - len(finished)}
                         if act:
                             out["action_required"] = act
+                        if tok:
+                            out["delivery"] = tok
                         return out
                     if len(held) == len(rows):  # nothing will finish until someone releases a hold
                         out = {"jobs": [], "pending": 0, "none_pending": True}
@@ -822,7 +901,8 @@ class Service:
                 raise Err("drift", f"{j['hold_reason']}; release with accept_drift to run on the current source")
             f["identity"] = json.dumps(snapshot_identity(json.loads(j["cmd"]), j["cwd"],
                                                          json.loads(j["identity"] or "{}").get("watch")))
-        self.upd(j["id"], status="queued", hold_reason=None, elig_since=time.time(), reported=0, **f)
+        self.upd(j["id"], status="queued", hold_reason=None, elig_since=time.time(), reported=0, delivery=None,
+                 sent_at=None, **f)
         self.action(j["id"], actor, "release", {"accept_drift": True} if accept_drift else None)
         self.event("released", j, by=actor)
 
